@@ -1,0 +1,12 @@
+{
+  "lm_studio_base_url": "http://localhost:1234/v1",
+  "api_key": "lm-studio",
+  "host": "0.0.0.0",
+  "port": 8000,
+  "request_timeout_seconds": 120,
+  "defaults": {
+    "temperature": 0.7,
+    "max_tokens": 1024,
+    "system_prompt": "You are a helpful assistant."
+  }
+}

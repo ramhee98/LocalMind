@@ -1,0 +1,29 @@
+# Local configuration (copy config.template.json -> config.json)
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Environment files
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
