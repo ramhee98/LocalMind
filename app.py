@@ -14,22 +14,28 @@ and the LM Studio native REST API for model lifecycle management:
 Image generation (OpenAI-compatible /images/generations, capability-detected):
   * GET  /api/images/capability  -> whether the connected server can generate images
   * POST /api/images             -> generate image(s) from a text prompt
+
+Document upload (text is extracted server-side and injected into the chat):
+  * POST /api/upload             -> extract text from an uploaded PDF
 """
 
 from __future__ import annotations
 
 import copy
+import io
 import json
 import logging
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("localmind")
@@ -62,6 +68,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "model": None,
         "default_size": "1024x1024",
         "timeout_seconds": 300,
+    },
+    "documents": {
+        "max_file_size_mb": 25,
+        "max_text_chars": 20000,
     },
 }
 
@@ -184,8 +194,69 @@ def get_config() -> dict[str, Any]:
         "defaults": CONFIG["defaults"],
         "model_management": CONFIG["model_management"],
         "image_generation": {"default_size": CONFIG["image_generation"]["default_size"]},
+        "documents": CONFIG["documents"],
         "base_url": CONFIG["lm_studio_base_url"],
     }
+
+
+# ---------- Document upload ----------
+
+@app.post("/api/upload")
+async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
+    """Extract text from an uploaded PDF for use as chat context."""
+    filename = file.filename or "document.pdf"
+    if not filename.lower().endswith(".pdf"):
+        return JSONResponse(status_code=400,
+                            content={"error": "Only PDF files are supported."})
+
+    data = await file.read()
+    max_bytes = CONFIG["documents"]["max_file_size_mb"] * 1024 * 1024
+    if len(data) > max_bytes:
+        return JSONResponse(status_code=400, content={
+            "error": f"File is too large "
+                     f"({len(data) / 1024 / 1024:.1f} MB, "
+                     f"limit {CONFIG['documents']['max_file_size_mb']} MB)."})
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        if reader.is_encrypted:
+            # Try an empty password; many PDFs are only owner-locked.
+            if not reader.decrypt(""):
+                return JSONResponse(status_code=400, content={
+                    "error": "This PDF is password-protected and cannot be read."})
+        pages = [page.extract_text() or "" for page in reader.pages]
+    except PdfReadError as exc:
+        logger.warning("Failed to parse PDF %s: %s", filename, exc)
+        return JSONResponse(status_code=400, content={
+            "error": "This file could not be parsed as a PDF."})
+    except Exception:  # noqa: BLE001 — malformed PDFs raise various errors
+        logger.exception("Unexpected error while parsing PDF %s", filename)
+        return JSONResponse(status_code=400, content={
+            "error": "This file could not be parsed as a PDF."})
+
+    text = "\n\n".join(
+        f"[Page {number}]\n{content.strip()}"
+        for number, content in enumerate(pages, start=1)
+        if content.strip()
+    )
+    if not text:
+        return JSONResponse(status_code=400, content={
+            "error": "No extractable text found — this PDF appears to contain "
+                     "only scanned images. OCR is not supported."})
+
+    max_chars = CONFIG["documents"]["max_text_chars"]
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars] + "\n\n[Document truncated]"
+    logger.info("Extracted %s chars from %s (%s pages%s)",
+                len(text), filename, len(pages), ", truncated" if truncated else "")
+    return JSONResponse(content={
+        "filename": filename,
+        "pages": len(pages),
+        "chars": len(text),
+        "truncated": truncated,
+        "text": text,
+    })
 
 
 # ---------- Image generation ----------

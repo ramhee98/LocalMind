@@ -105,6 +105,10 @@
           ✨ Enhance prompt with <span id="enhance-model-label">the selected model</span>
         </label>
       </div>
+      <div id="attachments-bar" class="attachments-bar hidden"></div>
+      <button id="attach-button" class="icon-button" type="button"
+              title="Attach a PDF" aria-label="Attach a PDF document">📎</button>
+      <input type="file" id="file-input" accept=".pdf,application/pdf" multiple hidden>
       <button id="image-toggle" class="icon-button hidden" type="button"
               title="Image generation mode" aria-label="Toggle image generation mode">🎨</button>
       <textarea id="message-input" rows="1"

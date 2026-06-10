@@ -32,6 +32,10 @@
   const imageOptions = document.getElementById("image-options");
   const enhancePromptInput = document.getElementById("enhance-prompt");
   const enhanceModelLabel = document.getElementById("enhance-model-label");
+  const attachButton = document.getElementById("attach-button");
+  const fileInput = document.getElementById("file-input");
+  const attachmentsBar = document.getElementById("attachments-bar");
+  const appRoot = document.querySelector(".app");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -42,6 +46,9 @@
   let imageMode = false;
   let imageGenSupported = false;
   let imageGenDetail = "";
+  /** Uploaded documents waiting to be sent with the next message. */
+  let attachments = [];
+  let attachmentCounter = 0;
   /** Model keys / instance ids with an in-flight load or unload request. */
   const busyModels = new Set();
 
@@ -393,11 +400,103 @@
   }
 
   function updateSendState() {
+    const uploading = attachments.some((doc) => doc.uploading);
     sendButton.disabled =
-      isStreaming || !messageInput.value.trim() || (!imageMode && !modelSelect.value);
+      isStreaming || uploading || !messageInput.value.trim() ||
+      (!imageMode && !modelSelect.value);
     sendButton.textContent = imageMode ? "Generate" : "Send";
     updateEnhanceLabel();
   }
+
+  // ---------- Document attachments ----------
+
+  function renderAttachments() {
+    attachmentsBar.innerHTML = "";
+    attachmentsBar.classList.toggle("hidden", !attachments.length);
+    for (const doc of attachments) {
+      const chip = document.createElement("span");
+      chip.className = `attachment-chip${doc.uploading ? " uploading" : ""}`;
+
+      const name = document.createElement("span");
+      name.className = "chip-name";
+      name.textContent = `📄 ${doc.name}`;
+      chip.appendChild(name);
+
+      const meta = document.createElement("span");
+      meta.className = "chip-meta";
+      if (doc.uploading) {
+        meta.innerHTML = "<span class='spinner'></span>";
+      } else {
+        meta.textContent = `${doc.pages} page${doc.pages === 1 ? "" : "s"}` +
+                           (doc.truncated ? " · truncated" : "");
+      }
+      chip.appendChild(meta);
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chip-remove";
+      remove.setAttribute("aria-label", `Remove ${doc.name}`);
+      remove.textContent = "✕";
+      remove.addEventListener("click", () => {
+        attachments = attachments.filter((entry) => entry.id !== doc.id);
+        renderAttachments();
+        updateSendState();
+      });
+      chip.appendChild(remove);
+
+      attachmentsBar.appendChild(chip);
+    }
+  }
+
+  async function uploadFiles(fileList) {
+    for (const file of fileList) {
+      if (!file.name.toLowerCase().endsWith(".pdf")) {
+        toast(`${file.name}: only PDF files are supported.`, "error", 6000);
+        continue;
+      }
+      const doc = { id: ++attachmentCounter, name: file.name, uploading: true };
+      attachments.push(doc);
+      renderAttachments();
+      updateSendState();
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        const response = await fetch("/api/upload", { method: "POST", body: form });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Upload failed.");
+        Object.assign(doc, data, { uploading: false });
+        if (data.truncated) {
+          toast(`${doc.name} is long — only the first part of the text is used.`,
+                "error", 7000);
+        }
+      } catch (error) {
+        attachments = attachments.filter((entry) => entry.id !== doc.id);
+        toast(`${doc.name}: ${error.message || "upload failed."}`, "error", 8000);
+      }
+      renderAttachments();
+      updateSendState();
+    }
+  }
+
+  attachButton.addEventListener("click", () => fileInput.click());
+
+  fileInput.addEventListener("change", () => {
+    uploadFiles([...fileInput.files]);
+    fileInput.value = "";
+  });
+
+  document.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    appRoot.classList.add("drag-over");
+  });
+  document.addEventListener("dragleave", (event) => {
+    if (!event.relatedTarget) appRoot.classList.remove("drag-over");
+  });
+  document.addEventListener("drop", (event) => {
+    event.preventDefault();
+    appRoot.classList.remove("drag-over");
+    if (event.dataTransfer?.files?.length) uploadFiles([...event.dataTransfer.files]);
+  });
 
   // ---------- Image generation ----------
 
@@ -520,6 +619,8 @@
   clearChatButton.addEventListener("click", () => {
     if (isStreaming) return;
     messages = [];
+    attachments = [];
+    renderAttachments();
     chatWindow.querySelectorAll(".message").forEach((node) => node.remove());
   });
 
@@ -542,8 +643,29 @@
       return;
     }
 
-    appendMessage("user", content);
-    messages.push({ role: "user", content });
+    const docs = attachments.filter((doc) => !doc.uploading);
+    const bubble = appendMessage("user", content);
+    if (docs.length) {
+      const tags = document.createElement("div");
+      tags.className = "message-attachments";
+      for (const doc of docs) {
+        const tag = document.createElement("span");
+        tag.className = "doc-tag";
+        tag.textContent = `📄 ${doc.name} (${doc.pages} p.)`;
+        tags.appendChild(tag);
+      }
+      bubble.prepend(tags);
+    }
+    // The extracted document text is sent to the LLM but only shown as a tag.
+    const docBlocks = docs
+      .map((doc) => `[Attached document: ${doc.name}]\n${doc.text}`)
+      .join("\n\n");
+    messages.push({
+      role: "user",
+      content: docBlocks ? `${docBlocks}\n\n${content}` : content,
+    });
+    attachments = [];
+    renderAttachments();
 
     const assistantBubble = appendMessage("assistant", "");
     assistantBubble.classList.add("pending");

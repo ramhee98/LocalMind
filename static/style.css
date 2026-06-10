@@ -591,6 +591,74 @@ input[type="number"] {
   color: var(--text-muted);
 }
 
+/* ---------- Document attachments ---------- */
+
+.attachments-bar {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  max-width: 100%;
+}
+
+.attachment-chip .chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+
+.attachment-chip .chip-meta { color: var(--text-muted); }
+
+.attachment-chip.uploading { border-color: var(--accent); }
+
+.attachment-chip .chip-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.attachment-chip .chip-remove:hover { color: var(--error); }
+
+.message .message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.message .doc-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(108, 140, 255, 0.12);
+  border: 1px solid var(--accent);
+}
+
+.app.drag-over .chat-window {
+  outline: 2px dashed var(--accent);
+  outline-offset: -8px;
+  border-radius: var(--radius);
+}
+
 #message-input {
   flex: 1;
   resize: none;
