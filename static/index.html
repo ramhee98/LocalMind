@@ -49,6 +49,18 @@
         <input type="number" id="max-tokens" min="1" max="131072" step="1" value="1024">
       </div>
       <div class="setting">
+        <label for="reasoning-effort">Thinking</label>
+        <select id="reasoning-effort">
+          <option value="" selected>Model default</option>
+          <option value="none">Off</option>
+          <option value="minimal">Minimal</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">Extra high</option>
+        </select>
+      </div>
+      <div class="setting">
         <label for="image-size">Image size</label>
         <select id="image-size">
           <option value="512x512">512 × 512</option>
@@ -107,8 +119,9 @@
       </div>
       <div id="attachments-bar" class="attachments-bar hidden"></div>
       <button id="attach-button" class="icon-button" type="button"
-              title="Attach a PDF" aria-label="Attach a PDF document">📎</button>
-      <input type="file" id="file-input" accept=".pdf,application/pdf" multiple hidden>
+              title="Attach files or images" aria-label="Attach files or images">📎</button>
+      <input type="file" id="file-input" multiple hidden
+             accept=".pdf,.txt,.md,.markdown,.rst,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.conf,.log,.xml,.html,.css,.js,.ts,.py,.java,.c,.cpp,.h,.hpp,.go,.rs,.rb,.php,.sh,.sql,image/*">
       <button id="image-toggle" class="icon-button hidden" type="button"
               title="Image generation mode" aria-label="Toggle image generation mode">🎨</button>
       <textarea id="message-input" rows="1"

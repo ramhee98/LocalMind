@@ -653,6 +653,46 @@ input[type="number"] {
   border: 1px solid var(--accent);
 }
 
+.chip-thumb {
+  width: 26px;
+  height: 26px;
+  object-fit: cover;
+  border-radius: 6px;
+  margin-right: 2px;
+}
+
+.message .msg-thumb {
+  max-width: 180px;
+  max-height: 140px;
+  border-radius: 10px;
+  display: block;
+}
+
+/* ---------- Thinking (reasoning) block ---------- */
+
+.thinking {
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(154, 161, 178, 0.07);
+  font-size: 0.8rem;
+}
+
+.thinking summary {
+  cursor: pointer;
+  padding: 7px 11px;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.thinking .thinking-body {
+  padding: 2px 11px 9px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
 .app.drag-over .chat-window {
   outline: 2px dashed var(--accent);
   outline-offset: -8px;

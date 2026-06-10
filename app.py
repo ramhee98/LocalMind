@@ -26,7 +26,7 @@ import io
 import json
 import logging
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Union
 
 import httpx
 from fastapi import FastAPI, File, UploadFile
@@ -144,7 +144,9 @@ app = FastAPI(title="LocalMind", version="1.1.0")
 
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(system|user|assistant)$")
-    content: str
+    # Either plain text or OpenAI content parts (text + image_url) for
+    # multimodal messages sent to vision models.
+    content: Union[str, list[dict[str, Any]]]
 
 
 class ChatRequest(BaseModel):
@@ -152,6 +154,9 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     temperature: float = Field(default=CONFIG["defaults"]["temperature"], ge=0.0, le=2.0)
     max_tokens: int = Field(default=CONFIG["defaults"]["max_tokens"], ge=1, le=131072)
+    # LM Studio reasoning control; None leaves the model's default untouched.
+    reasoning_effort: Optional[str] = Field(
+        default=None, pattern="^(none|minimal|low|medium|high|xhigh)$")
 
 
 class LoadModelRequest(BaseModel):
@@ -201,22 +206,16 @@ def get_config() -> dict[str, Any]:
 
 # ---------- Document upload ----------
 
-@app.post("/api/upload")
-async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
-    """Extract text from an uploaded PDF for use as chat context."""
-    filename = file.filename or "document.pdf"
-    if not filename.lower().endswith(".pdf"):
-        return JSONResponse(status_code=400,
-                            content={"error": "Only PDF files are supported."})
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json", ".yaml",
+    ".yml", ".toml", ".ini", ".conf", ".log", ".xml", ".html", ".css",
+    ".js", ".ts", ".py", ".java", ".c", ".cpp", ".h", ".hpp", ".go",
+    ".rs", ".rb", ".php", ".sh", ".sql",
+}
 
-    data = await file.read()
-    max_bytes = CONFIG["documents"]["max_file_size_mb"] * 1024 * 1024
-    if len(data) > max_bytes:
-        return JSONResponse(status_code=400, content={
-            "error": f"File is too large "
-                     f"({len(data) / 1024 / 1024:.1f} MB, "
-                     f"limit {CONFIG['documents']['max_file_size_mb']} MB)."})
 
+def extract_pdf_text(data: bytes) -> Union[tuple[str, int], JSONResponse]:
+    """Return (text, page_count) or an error response."""
     try:
         reader = PdfReader(io.BytesIO(data))
         if reader.is_encrypted:
@@ -226,11 +225,11 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
                     "error": "This PDF is password-protected and cannot be read."})
         pages = [page.extract_text() or "" for page in reader.pages]
     except PdfReadError as exc:
-        logger.warning("Failed to parse PDF %s: %s", filename, exc)
+        logger.warning("Failed to parse PDF: %s", exc)
         return JSONResponse(status_code=400, content={
             "error": "This file could not be parsed as a PDF."})
     except Exception:  # noqa: BLE001 — malformed PDFs raise various errors
-        logger.exception("Unexpected error while parsing PDF %s", filename)
+        logger.exception("Unexpected error while parsing PDF")
         return JSONResponse(status_code=400, content={
             "error": "This file could not be parsed as a PDF."})
 
@@ -243,16 +242,54 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
         return JSONResponse(status_code=400, content={
             "error": "No extractable text found — this PDF appears to contain "
                      "only scanned images. OCR is not supported."})
+    return text, len(pages)
+
+
+@app.post("/api/upload")
+async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
+    """Extract text from an uploaded PDF or plain-text file for chat context."""
+    filename = file.filename or "document"
+    extension = Path(filename).suffix.lower()
+
+    data = await file.read()
+    max_bytes = CONFIG["documents"]["max_file_size_mb"] * 1024 * 1024
+    if len(data) > max_bytes:
+        return JSONResponse(status_code=400, content={
+            "error": f"File is too large "
+                     f"({len(data) / 1024 / 1024:.1f} MB, "
+                     f"limit {CONFIG['documents']['max_file_size_mb']} MB)."})
+
+    pages: Optional[int] = None
+    if extension == ".pdf":
+        result = extract_pdf_text(data)
+        if isinstance(result, JSONResponse):
+            return result
+        text, pages = result
+    elif extension in TEXT_EXTENSIONS:
+        try:
+            text = data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return JSONResponse(status_code=400, content={
+                "error": f"{filename} is not valid UTF-8 text."})
+        if not text:
+            return JSONResponse(status_code=400, content={"error": f"{filename} is empty."})
+    else:
+        return JSONResponse(status_code=400, content={
+            "error": f"Unsupported file type '{extension or 'none'}'. "
+                     "Supported: PDF, plain-text, and code files. "
+                     "Images can be attached directly in the chat."})
 
     max_chars = CONFIG["documents"]["max_text_chars"]
     truncated = len(text) > max_chars
     if truncated:
         text = text[:max_chars] + "\n\n[Document truncated]"
-    logger.info("Extracted %s chars from %s (%s pages%s)",
-                len(text), filename, len(pages), ", truncated" if truncated else "")
+    logger.info("Extracted %s chars from %s%s%s",
+                len(text), filename,
+                f" ({pages} pages)" if pages else "",
+                ", truncated" if truncated else "")
     return JSONResponse(content={
         "filename": filename,
-        "pages": len(pages),
+        "pages": pages,
         "chars": len(text),
         "truncated": truncated,
         "text": text,
@@ -543,19 +580,27 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
     is already committed once streaming has started.
     """
     try:
+        extra_body: dict[str, Any] = {}
+        if request.reasoning_effort:
+            extra_body["reasoning_effort"] = request.reasoning_effort
         stream = client.chat.completions.create(
             model=request.model,
             messages=[message.model_dump() for message in request.messages],
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             stream=True,
+            extra_body=extra_body or None,
         )
         for chunk in stream:
             if not chunk.choices:
                 continue
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield f"data: {json.dumps({'content': delta})}\n\n"
+            delta = chunk.choices[0].delta
+            # LM Studio streams thinking separately for reasoning models.
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
+            if delta.content:
+                yield f"data: {json.dumps({'content': delta.content})}\n\n"
         yield "data: [DONE]\n\n"
     except (APIConnectionError, APITimeoutError):
         logger.exception("LM Studio unreachable during chat completion")

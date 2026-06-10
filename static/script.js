@@ -36,6 +36,7 @@
   const fileInput = document.getElementById("file-input");
   const attachmentsBar = document.getElementById("attachments-bar");
   const appRoot = document.querySelector(".app");
+  const reasoningSelect = document.getElementById("reasoning-effort");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -419,16 +420,28 @@
 
       const name = document.createElement("span");
       name.className = "chip-name";
-      name.textContent = `📄 ${doc.name}`;
+      if (doc.kind === "image" && doc.dataUrl) {
+        const thumb = document.createElement("img");
+        thumb.className = "chip-thumb";
+        thumb.src = doc.dataUrl;
+        thumb.alt = doc.name;
+        chip.prepend(thumb);
+        name.textContent = doc.name;
+      } else {
+        name.textContent = `${doc.kind === "image" ? "🖼" : "📄"} ${doc.name}`;
+      }
       chip.appendChild(name);
 
       const meta = document.createElement("span");
       meta.className = "chip-meta";
       if (doc.uploading) {
         meta.innerHTML = "<span class='spinner'></span>";
+      } else if (doc.kind === "image") {
+        meta.textContent = "image";
       } else {
-        meta.textContent = `${doc.pages} page${doc.pages === 1 ? "" : "s"}` +
-                           (doc.truncated ? " · truncated" : "");
+        meta.textContent = (doc.pages
+          ? `${doc.pages} page${doc.pages === 1 ? "" : "s"}`
+          : `${doc.chars} chars`) + (doc.truncated ? " · truncated" : "");
       }
       chip.appendChild(meta);
 
@@ -448,13 +461,38 @@
     }
   }
 
+  function attachImage(file) {
+    if (file.size > 15 * 1024 * 1024) {
+      toast(`${file.name}: image is too large (limit 15 MB).`, "error", 6000);
+      return;
+    }
+    const name = file.name || `screenshot-${++attachmentCounter}.png`;
+    const doc = { id: ++attachmentCounter, name, kind: "image", uploading: true };
+    attachments.push(doc);
+    renderAttachments();
+    updateSendState();
+    const reader = new FileReader();
+    reader.onload = () => {
+      Object.assign(doc, { dataUrl: reader.result, uploading: false });
+      renderAttachments();
+      updateSendState();
+    };
+    reader.onerror = () => {
+      attachments = attachments.filter((entry) => entry.id !== doc.id);
+      toast(`${name}: could not read the image.`, "error", 6000);
+      renderAttachments();
+      updateSendState();
+    };
+    reader.readAsDataURL(file);
+  }
+
   async function uploadFiles(fileList) {
     for (const file of fileList) {
-      if (!file.name.toLowerCase().endsWith(".pdf")) {
-        toast(`${file.name}: only PDF files are supported.`, "error", 6000);
+      if (file.type.startsWith("image/")) {
+        attachImage(file);
         continue;
       }
-      const doc = { id: ++attachmentCounter, name: file.name, uploading: true };
+      const doc = { id: ++attachmentCounter, name: file.name, kind: "document", uploading: true };
       attachments.push(doc);
       renderAttachments();
       updateSendState();
@@ -496,6 +534,19 @@
     event.preventDefault();
     appRoot.classList.remove("drag-over");
     if (event.dataTransfer?.files?.length) uploadFiles([...event.dataTransfer.files]);
+  });
+
+  // Paste screenshots/images straight from the clipboard.
+  document.addEventListener("paste", (event) => {
+    const items = [...(event.clipboardData?.items || [])];
+    const images = items
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (images.length) {
+      event.preventDefault();
+      uploadFiles(images);
+    }
   });
 
   // ---------- Image generation ----------
@@ -643,26 +694,44 @@
       return;
     }
 
-    const docs = attachments.filter((doc) => !doc.uploading);
+    const docs = attachments.filter((doc) => !doc.uploading && doc.kind !== "image");
+    const images = attachments.filter((doc) => !doc.uploading && doc.kind === "image");
     const bubble = appendMessage("user", content);
-    if (docs.length) {
+    if (docs.length || images.length) {
       const tags = document.createElement("div");
       tags.className = "message-attachments";
+      for (const image of images) {
+        const thumb = document.createElement("img");
+        thumb.className = "msg-thumb";
+        thumb.src = image.dataUrl;
+        thumb.alt = image.name;
+        tags.appendChild(thumb);
+      }
       for (const doc of docs) {
         const tag = document.createElement("span");
         tag.className = "doc-tag";
-        tag.textContent = `📄 ${doc.name} (${doc.pages} p.)`;
+        tag.textContent = `📄 ${doc.name}${doc.pages ? ` (${doc.pages} p.)` : ""}`;
         tags.appendChild(tag);
       }
       bubble.prepend(tags);
     }
-    // The extracted document text is sent to the LLM but only shown as a tag.
+    // Extracted document text is sent to the LLM but only shown as a tag;
+    // images become OpenAI image_url content parts for vision models.
     const docBlocks = docs
       .map((doc) => `[Attached document: ${doc.name}]\n${doc.text}`)
       .join("\n\n");
+    const fullText = docBlocks ? `${docBlocks}\n\n${content}` : content;
     messages.push({
       role: "user",
-      content: docBlocks ? `${docBlocks}\n\n${content}` : content,
+      content: images.length
+        ? [
+            ...images.map((image) => ({
+              type: "image_url",
+              image_url: { url: image.dataUrl },
+            })),
+            { type: "text", text: fullText },
+          ]
+        : fullText,
     });
     attachments = [];
     renderAttachments();
@@ -678,7 +747,47 @@
         : messages,
       temperature: Number(temperatureInput.value),
       max_tokens: Math.max(1, Math.floor(Number(maxTokensInput.value) || 1024)),
+      ...(reasoningSelect.value ? { reasoning_effort: reasoningSelect.value } : {}),
     };
+
+    // Lazily built structure inside the assistant bubble: an optional
+    // collapsible thinking block followed by the answer text.
+    let reasoningContent = "";
+    let thinkingDetails = null;
+    let thinkingBody = null;
+    let contentSpan = null;
+
+    function ensureContentSpan() {
+      if (!contentSpan) {
+        assistantBubble.textContent = "";
+        contentSpan = document.createElement("span");
+        assistantBubble.appendChild(contentSpan);
+      }
+    }
+
+    function appendReasoning(text) {
+      ensureContentSpan();
+      if (!thinkingDetails) {
+        thinkingDetails = document.createElement("details");
+        thinkingDetails.className = "thinking";
+        thinkingDetails.open = true;
+        const summary = document.createElement("summary");
+        summary.textContent = "💭 Thinking…";
+        thinkingBody = document.createElement("div");
+        thinkingBody.className = "thinking-body";
+        thinkingDetails.append(summary, thinkingBody);
+        assistantBubble.insertBefore(thinkingDetails, contentSpan);
+      }
+      reasoningContent += text;
+      thinkingBody.textContent = reasoningContent;
+    }
+
+    function finishThinking() {
+      if (thinkingDetails && thinkingDetails.open) {
+        thinkingDetails.open = false;
+        thinkingDetails.querySelector("summary").textContent = "💭 Thoughts";
+      }
+    }
 
     try {
       const response = await fetch("/api/chat", {
@@ -716,14 +825,22 @@
 
           const parsed = JSON.parse(data);
           if (parsed.error) throw new Error(parsed.error);
+          if (parsed.reasoning) {
+            appendReasoning(parsed.reasoning);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+          }
           if (parsed.content) {
+            if (!assistantContent) finishThinking();
+            ensureContentSpan();
             assistantContent += parsed.content;
-            assistantBubble.textContent = assistantContent;
+            contentSpan.textContent = assistantContent;
             chatWindow.scrollTop = chatWindow.scrollHeight;
           }
         }
       }
 
+      finishThinking();
+      // Only the final answer (not the thinking) goes back into the history.
       messages.push({ role: "assistant", content: assistantContent });
     } catch (error) {
       if (assistantContent) {
