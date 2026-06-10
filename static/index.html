@@ -98,6 +98,13 @@
     </main>
 
     <footer class="composer" id="composer">
+      <div id="image-options" class="image-options hidden">
+        <label class="enhance-toggle"
+               title="Rewrite your idea into a detailed image prompt with the selected chat model before generating">
+          <input type="checkbox" id="enhance-prompt" checked>
+          ✨ Enhance prompt with <span id="enhance-model-label">the selected model</span>
+        </label>
+      </div>
       <button id="image-toggle" class="icon-button hidden" type="button"
               title="Image generation mode" aria-label="Toggle image generation mode">🎨</button>
       <textarea id="message-input" rows="1"

@@ -29,6 +29,9 @@
   const composer = document.getElementById("composer");
   const imageToggle = document.getElementById("image-toggle");
   const imageSizeSelect = document.getElementById("image-size");
+  const imageOptions = document.getElementById("image-options");
+  const enhancePromptInput = document.getElementById("enhance-prompt");
+  const enhanceModelLabel = document.getElementById("enhance-model-label");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -393,6 +396,7 @@
     sendButton.disabled =
       isStreaming || !messageInput.value.trim() || (!imageMode && !modelSelect.value);
     sendButton.textContent = imageMode ? "Generate" : "Send";
+    updateEnhanceLabel();
   }
 
   // ---------- Image generation ----------
@@ -414,10 +418,16 @@
       : `Image generation unavailable — ${imageGenDetail}`;
   }
 
+  function updateEnhanceLabel() {
+    enhanceModelLabel.textContent = modelSelect.value || "the selected model";
+  }
+
   function setImageMode(on) {
     imageMode = on;
     imageToggle.classList.toggle("active", on);
     composer.classList.toggle("image-mode", on);
+    imageOptions.classList.toggle("hidden", !on);
+    updateEnhanceLabel();
     messageInput.placeholder = on
       ? "Describe the image to generate… (Enter to generate)"
       : "Type a message… (Enter to send, Shift+Enter for a new line)";
@@ -434,17 +444,31 @@
   });
 
   async function sendImageMessage(prompt) {
+    const enhanceWith =
+      enhancePromptInput.checked && modelSelect.value ? modelSelect.value : null;
     appendMessage("user", prompt);
-    const bubble = appendMessage("assistant", "Generating image…");
+    const bubble = appendMessage(
+      "assistant",
+      enhanceWith ? `Enhancing prompt with ${enhanceWith}, then generating…` : "Generating image…",
+    );
     bubble.classList.add("pending");
     try {
       const response = await fetch("/api/images", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, size: imageSizeSelect.value, n: 1 }),
+        body: JSON.stringify({
+          prompt,
+          size: imageSizeSelect.value,
+          n: 1,
+          ...(enhanceWith ? { enhance_with: enhanceWith } : {}),
+        }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Image generation failed.");
+      if (data.enhancement_error) {
+        toast(`Prompt enhancement failed (${data.enhancement_error}) — used your original prompt.`,
+              "error", 8000);
+      }
       bubble.textContent = "";
       bubble.classList.add("image");
       data.images.forEach((src, index) => {
@@ -459,6 +483,12 @@
         download.className = "image-download";
         bubble.append(img, download);
       });
+      if (data.enhanced && data.prompt_used) {
+        const caption = document.createElement("div");
+        caption.className = "image-caption";
+        caption.textContent = `✨ ${data.prompt_used}`;
+        bubble.appendChild(caption);
+      }
       chatWindow.scrollTop = chatWindow.scrollHeight;
     } catch (error) {
       bubble.remove();

@@ -158,6 +158,8 @@ class ImageRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10_000)
     size: Optional[str] = Field(default=None, pattern=r"^\d{2,4}x\d{2,4}$")
     n: int = Field(default=1, ge=1, le=4)
+    # Chat model id used to rewrite the prompt before generation (optional).
+    enhance_with: Optional[str] = Field(default=None, min_length=1)
 
 
 def connection_error_payload() -> dict[str, str]:
@@ -189,6 +191,34 @@ def get_config() -> dict[str, Any]:
 # ---------- Image generation ----------
 
 _image_capability: Optional[dict[str, Any]] = None
+
+ENHANCE_SYSTEM_PROMPT = (
+    "You are an expert image-prompt engineer. Rewrite the user's idea as one "
+    "vivid, detailed prompt for a text-to-image model: subject, style, "
+    "lighting, composition, mood, quality keywords. Reply with the prompt "
+    "text only — no quotes, no preamble, no explanations."
+)
+
+
+def enhance_prompt(model: str, prompt: str) -> str:
+    """Have a chat LLM (e.g. Gemma in LM Studio) rewrite an image prompt."""
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": ENHANCE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+        max_tokens=500,
+        # Reasoning models would otherwise spend the whole token budget
+        # thinking; LM Studio supports turning that off per request.
+        extra_body={"reasoning_effort": "none"},
+    )
+    text = (completion.choices[0].message.content or "").strip()
+    # Some reasoning models emit a <think>...</think> block before the answer.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1].strip()
+    return text or prompt
 
 
 def probe_image_support() -> dict[str, Any]:
@@ -230,8 +260,20 @@ def image_capability(refresh: bool = False) -> dict[str, Any]:
 
 @app.post("/api/images")
 def generate_images(request: ImageRequest) -> JSONResponse:
+    prompt = request.prompt
+    enhancement_error: Optional[str] = None
+    if request.enhance_with:
+        try:
+            prompt = enhance_prompt(request.enhance_with, request.prompt)
+            logger.info("Prompt enhanced by %s: %r -> %r",
+                        request.enhance_with, request.prompt, prompt)
+        except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+            enhancement_error = getattr(exc, "message", None) or str(exc)
+            logger.warning("Prompt enhancement failed, using original prompt: %s",
+                           enhancement_error)
+
     kwargs: dict[str, Any] = {
-        "prompt": request.prompt,
+        "prompt": prompt,
         "n": request.n,
         "response_format": "b64_json",
     }
@@ -262,7 +304,12 @@ def generate_images(request: ImageRequest) -> JSONResponse:
         message = capability["detail"] if not capability["supported"] \
             else "The image server returned no images."
         return JSONResponse(status_code=502, content={"error": message})
-    return JSONResponse(content={"images": images})
+    return JSONResponse(content={
+        "images": images,
+        "prompt_used": prompt,
+        "enhanced": prompt != request.prompt,
+        "enhancement_error": enhancement_error,
+    })
 
 
 def fetch_native_models() -> list[dict[str, Any]]:

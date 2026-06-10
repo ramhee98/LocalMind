@@ -14,6 +14,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
   - **multiple instances** — load a model more than once and unload each instance individually,
   - **unload all** — free all memory with one click.
 - **Image generation (capability-detected)** — a 🎨 mode in the composer that generates images from text prompts via an OpenAI-compatible `/images/generations` endpoint. The UI detects automatically whether the connected server supports it; generated images render in the chat with click-to-zoom and a download link, and the image size is adjustable in settings.
+- **LLM prompt enhancement** — optionally let the selected chat model (e.g. Gemma in LM Studio) rewrite your short idea into a rich, detailed image prompt before generation; the enhanced prompt is shown under the image. If enhancement fails, the original prompt is used and you are notified.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -129,6 +130,8 @@ The chat model dropdown always reflects the currently loaded LLM instances and r
 
 Click the 🎨 button in the composer to switch to image mode, describe the image, and press **Enter** — the result appears in the chat (click to zoom, ⬇ to download). Pick the output size in the ⚙ settings panel.
 
+With **✨ Enhance prompt** enabled (visible in image mode), your idea is first rewritten into a detailed image prompt by the chat model selected in the dropdown — this is how your LM Studio LLM participates in image creation even though it cannot render images itself. The enhanced prompt is displayed under the generated image. Reasoning is disabled for this call (`reasoning_effort: none`) so reasoning models answer directly.
+
 The button activates only when the connected server actually supports image generation, which is detected at startup by probing the OpenAI-compatible `/images/generations` endpoint:
 
 - **LM Studio does not currently support image generation** (its models are text/vision-input only), so against a plain LM Studio setup the 🎨 button stays greyed out and explains why when clicked.
@@ -182,7 +185,7 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | `POST` | `/api/models/unload` | Unload one instance: `{"instance_id"}` |
 | `POST` | `/api/models/unload-all` | Unload every loaded instance |
 | `GET` | `/api/images/capability` | Whether the image API supports generation (`?refresh=true` re-probes) |
-| `POST` | `/api/images` | Generate image(s): `{"prompt", "size"?, "n"?}` |
+| `POST` | `/api/images` | Generate image(s): `{"prompt", "size"?, "n"?, "enhance_with"?}` |
 
 ## License
 
