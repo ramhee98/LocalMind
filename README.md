@@ -90,6 +90,11 @@ cp config.template.json config.json
 | `image_generation.timeout_seconds` | Timeout for image generation requests | `300` |
 | `documents.max_file_size_mb` | Maximum upload size for attached files | `25` |
 | `documents.max_text_chars` | Extracted text is truncated beyond this length | `20000` |
+| `tls.enabled` | Serve the app over HTTPS | `false` |
+| `tls.cert_file` | Path to a PEM certificate (`null` = auto-generate self-signed) | `null` |
+| `tls.key_file` | Path to the matching PEM private key | `null` |
+
+The config file path itself can be overridden with the `LOCALMIND_CONFIG` environment variable (useful for Docker or running multiple instances).
 
 `config.json` is gitignored, so your local settings never end up in version control. If it is missing, the app falls back to `config.template.json`, and finally to built-in defaults.
 
@@ -172,6 +177,23 @@ The button activates only when the connected server actually supports image gene
 ```
 
 Chat continues to use LM Studio regardless — the image API is fully independent. Image prompts are not added to the LLM chat history.
+
+## HTTPS
+
+Set `tls.enabled` to `true` and restart:
+
+- **With your own certificate** — point `tls.cert_file` and `tls.key_file` at your PEM files (e.g. from Let's Encrypt or an internal CA). Relative paths resolve against the project directory. If the files are missing or only one is set, the app refuses to start with a clear error rather than silently falling back.
+- **Without a certificate** — a self-signed ("snakeoil") certificate is generated automatically under `certs/` (gitignored), covering `localhost`, `127.0.0.1`, `::1`, and your machine's hostname, valid for 825 days. It is reused across restarts and regenerated shortly before expiry. Browsers will show a one-time security warning you must accept — fine for home-lab use; use a real certificate (or a reverse proxy like Caddy/Traefik) for anything beyond that.
+
+```json
+"tls": {
+  "enabled": true,
+  "cert_file": null,
+  "key_file": null
+}
+```
+
+Then open <https://localhost:8000>. HTTPS applies when starting via `python app.py`; if you run uvicorn directly, pass the flags yourself: `uvicorn app:app --ssl-certfile certs/snakeoil.crt --ssl-keyfile certs/snakeoil.key`.
 
 ## Deployment Notes
 
