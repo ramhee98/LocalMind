@@ -570,6 +570,34 @@ input[type="number"] {
   gap: 16px;
 }
 
+.composer-controls {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.composer-control {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.composer-control select {
+  padding: 4px 8px;
+  font-size: 0.78rem;
+  border-radius: 8px;
+}
+
+.composer-control select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .enhance-toggle {
   display: flex;
   align-items: center;

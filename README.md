@@ -127,7 +127,12 @@ Attachments ride along with the *next* message you send and can be removed (✕)
 
 ### Thinking (reasoning) control
 
-The ⚙ settings panel has a **Thinking** option mapped to LM Studio's `reasoning_effort` (`none` … `xhigh`); *Model default* leaves the model's own setting untouched. While a reasoning model thinks, the thoughts stream into a collapsible 💭 block above the answer, which folds closed when the actual answer begins. Thoughts are display-only — they are not sent back as context in later turns.
+The bar above the message box has two independent controls:
+
+- **💭 Thinking** — *Default* (leave the model's own behavior untouched), *On*, or *Off*.
+- **Effort** — *Minimal* to *Extra high*; applies only when Thinking is *On*.
+
+Together they map onto LM Studio's `reasoning_effort` (*Off* → `none`, *On* → the chosen effort). While a reasoning model thinks, the thoughts stream into a collapsible 💭 block above the answer, which folds closed when the actual answer begins. Thoughts are display-only — they are not sent back as context in later turns. The controls hide in image mode, where they don't apply.
 
 > Tip: reasoning consumes your `max_tokens` budget. If answers come back empty with thinking enabled, raise **Max tokens** in settings.
 

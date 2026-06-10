@@ -49,18 +49,6 @@
         <input type="number" id="max-tokens" min="1" max="131072" step="1" value="1024">
       </div>
       <div class="setting">
-        <label for="reasoning-effort">Thinking</label>
-        <select id="reasoning-effort">
-          <option value="" selected>Model default</option>
-          <option value="none">Off</option>
-          <option value="minimal">Minimal</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          <option value="xhigh">Extra high</option>
-        </select>
-      </div>
-      <div class="setting">
         <label for="image-size">Image size</label>
         <select id="image-size">
           <option value="512x512">512 × 512</option>
@@ -110,6 +98,26 @@
     </main>
 
     <footer class="composer" id="composer">
+      <div id="composer-controls" class="composer-controls">
+        <label class="composer-control" for="thinking-mode">
+          💭 Thinking
+          <select id="thinking-mode">
+            <option value="" selected>Default</option>
+            <option value="on">On</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <label class="composer-control" for="effort-level">
+          Effort
+          <select id="effort-level" disabled title="Effort applies when thinking is On">
+            <option value="minimal">Minimal</option>
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">Extra high</option>
+          </select>
+        </label>
+      </div>
       <div id="image-options" class="image-options hidden">
         <label class="enhance-toggle"
                title="Rewrite your idea into a detailed image prompt with the selected chat model before generating">

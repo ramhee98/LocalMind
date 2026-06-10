@@ -36,7 +36,9 @@
   const fileInput = document.getElementById("file-input");
   const attachmentsBar = document.getElementById("attachments-bar");
   const appRoot = document.querySelector(".app");
-  const reasoningSelect = document.getElementById("reasoning-effort");
+  const composerControls = document.getElementById("composer-controls");
+  const thinkingModeSelect = document.getElementById("thinking-mode");
+  const effortLevelSelect = document.getElementById("effort-level");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -572,11 +574,26 @@
     enhanceModelLabel.textContent = modelSelect.value || "the selected model";
   }
 
+  // ---------- Thinking controls ----------
+
+  /** Map the two bottom-bar selects onto LM Studio's reasoning_effort. */
+  function reasoningEffortValue() {
+    if (thinkingModeSelect.value === "off") return "none";
+    if (thinkingModeSelect.value === "on") return effortLevelSelect.value;
+    return null; // Default: leave the model's own behavior untouched.
+  }
+
+  thinkingModeSelect.addEventListener("change", () => {
+    effortLevelSelect.disabled = thinkingModeSelect.value !== "on";
+  });
+
   function setImageMode(on) {
     imageMode = on;
     imageToggle.classList.toggle("active", on);
     composer.classList.toggle("image-mode", on);
     imageOptions.classList.toggle("hidden", !on);
+    // Thinking applies to text chat only; hide it while generating images.
+    composerControls.classList.toggle("hidden", on);
     updateEnhanceLabel();
     messageInput.placeholder = on
       ? "Describe the image to generate… (Enter to generate)"
@@ -747,7 +764,7 @@
         : messages,
       temperature: Number(temperatureInput.value),
       max_tokens: Math.max(1, Math.floor(Number(maxTokensInput.value) || 1024)),
-      ...(reasoningSelect.value ? { reasoning_effort: reasoningSelect.value } : {}),
+      ...(reasoningEffortValue() ? { reasoning_effort: reasoningEffortValue() } : {}),
     };
 
     // Lazily built structure inside the assistant bubble: an optional
