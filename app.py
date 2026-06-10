@@ -10,6 +10,10 @@ and the LM Studio native REST API for model lifecycle management:
   * POST /api/models/load        -> load a model (optional idle TTL and context length)
   * POST /api/models/unload      -> unload a single loaded instance
   * POST /api/models/unload-all  -> unload every loaded instance
+
+Image generation (OpenAI-compatible /images/generations, capability-detected):
+  * GET  /api/images/capability  -> whether the connected server can generate images
+  * POST /api/images             -> generate image(s) from a text prompt
 """
 
 from __future__ import annotations
@@ -52,6 +56,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default_context_length": None,
         "load_timeout_seconds": 600,
         "status_refresh_seconds": 10,
+    },
+    "image_generation": {
+        "api_base_url": None,
+        "model": None,
+        "default_size": "1024x1024",
+        "timeout_seconds": 300,
     },
 }
 
@@ -107,6 +117,18 @@ native_client = httpx.Client(
     timeout=CONFIG["request_timeout_seconds"],
 )
 
+# Image generation can target a different OpenAI-compatible server (e.g.
+# LocalAI or a Stable Diffusion gateway); it defaults to the LM Studio URL.
+IMAGE_API_BASE = (
+    CONFIG["image_generation"]["api_base_url"] or CONFIG["lm_studio_base_url"]
+).rstrip("/")
+
+image_client = OpenAI(
+    base_url=IMAGE_API_BASE,
+    api_key=CONFIG["api_key"],
+    timeout=CONFIG["image_generation"]["timeout_seconds"],
+)
+
 app = FastAPI(title="LocalMind", version="1.1.0")
 
 
@@ -132,6 +154,12 @@ class UnloadModelRequest(BaseModel):
     instance_id: str = Field(min_length=1)
 
 
+class ImageRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=10_000)
+    size: Optional[str] = Field(default=None, pattern=r"^\d{2,4}x\d{2,4}$")
+    n: int = Field(default=1, ge=1, le=4)
+
+
 def connection_error_payload() -> dict[str, str]:
     return {
         "error": (
@@ -153,8 +181,88 @@ def get_config() -> dict[str, Any]:
     return {
         "defaults": CONFIG["defaults"],
         "model_management": CONFIG["model_management"],
+        "image_generation": {"default_size": CONFIG["image_generation"]["default_size"]},
         "base_url": CONFIG["lm_studio_base_url"],
     }
+
+
+# ---------- Image generation ----------
+
+_image_capability: Optional[dict[str, Any]] = None
+
+
+def probe_image_support() -> dict[str, Any]:
+    """Detect whether the image API server offers /images/generations.
+
+    An intentionally empty request is sent: a server that implements the
+    endpoint answers with a validation error, while LM Studio (which currently
+    has no image generation) answers 200/404 with an "Unexpected endpoint"
+    error body.
+    """
+    try:
+        response = httpx.post(f"{IMAGE_API_BASE}/images/generations", json={}, timeout=10)
+    except httpx.HTTPError:
+        return {
+            "supported": False,
+            "detail": f"The image API server at {IMAGE_API_BASE} is unreachable.",
+        }
+    if response.status_code == 404 or "Unexpected endpoint" in response.text[:500]:
+        return {
+            "supported": False,
+            "detail": (
+                "The connected server does not support image generation. "
+                "LM Studio currently has no image endpoint — point "
+                "image_generation.api_base_url in config.json at an "
+                "OpenAI-compatible image server to enable this."
+            ),
+        }
+    return {"supported": True, "detail": f"Image generation endpoint detected at {IMAGE_API_BASE}."}
+
+
+@app.get("/api/images/capability")
+def image_capability(refresh: bool = False) -> dict[str, Any]:
+    global _image_capability
+    if _image_capability is None or refresh:
+        _image_capability = probe_image_support()
+        logger.info("Image generation capability: %s", _image_capability)
+    return _image_capability
+
+
+@app.post("/api/images")
+def generate_images(request: ImageRequest) -> JSONResponse:
+    kwargs: dict[str, Any] = {
+        "prompt": request.prompt,
+        "n": request.n,
+        "response_format": "b64_json",
+    }
+    if request.size:
+        kwargs["size"] = request.size
+    if CONFIG["image_generation"]["model"]:
+        kwargs["model"] = CONFIG["image_generation"]["model"]
+    try:
+        result = image_client.images.generate(**kwargs)
+    except (APIConnectionError, APITimeoutError):
+        logger.exception("Image API unreachable during generation")
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"Cannot reach the image API server at {IMAGE_API_BASE}."},
+        )
+    except APIStatusError as exc:
+        logger.exception("Image API returned an error during generation")
+        return JSONResponse(status_code=502, content={"error": f"Image API error: {exc.message}"})
+
+    images: list[str] = []
+    for item in result.data or []:
+        if getattr(item, "b64_json", None):
+            images.append(f"data:image/png;base64,{item.b64_json}")
+        elif getattr(item, "url", None):
+            images.append(item.url)
+    if not images:
+        capability = probe_image_support()
+        message = capability["detail"] if not capability["supported"] \
+            else "The image server returned no images."
+        return JSONResponse(status_code=502, content={"error": message})
+    return JSONResponse(content={"images": images})
 
 
 def fetch_native_models() -> list[dict[str, Any]]:

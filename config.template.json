@@ -15,5 +15,11 @@
     "default_context_length": null,
     "load_timeout_seconds": 600,
     "status_refresh_seconds": 10
+  },
+  "image_generation": {
+    "api_base_url": null,
+    "model": null,
+    "default_size": "1024x1024",
+    "timeout_seconds": 300
   }
 }
