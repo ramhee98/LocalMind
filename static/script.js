@@ -39,6 +39,11 @@
   const composerControls = document.getElementById("composer-controls");
   const thinkingModeSelect = document.getElementById("thinking-mode");
   const effortLevelSelect = document.getElementById("effort-level");
+  const sidebar = document.getElementById("sidebar");
+  const sidebarToggle = document.getElementById("sidebar-toggle");
+  const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+  const conversationList = document.getElementById("conversation-list");
+  const newChatButton = document.getElementById("new-chat");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -52,6 +57,8 @@
   /** Uploaded documents waiting to be sent with the next message. */
   let attachments = [];
   let attachmentCounter = 0;
+  /** Server-side conversation id; created lazily on the first exchange. */
+  let currentConversationId = null;
   /** Model keys / instance ids with an in-flight load or unload request. */
   const busyModels = new Set();
 
@@ -684,13 +691,259 @@
   sendButton.addEventListener("click", sendMessage);
   modelSelect.addEventListener("change", updateSendState);
 
-  clearChatButton.addEventListener("click", () => {
+  // ---------- Conversations (server-side persistence) ----------
+
+  function clearChatWindow() {
+    chatWindow.querySelectorAll(".message").forEach((node) => node.remove());
+  }
+
+  function startNewChat() {
     if (isStreaming) return;
     messages = [];
     attachments = [];
+    currentConversationId = null;
     renderAttachments();
-    chatWindow.querySelectorAll(".message").forEach((node) => node.remove());
+    clearChatWindow();
+    highlightActiveConversation();
+  }
+
+  clearChatButton.addEventListener("click", startNewChat);
+  newChatButton.addEventListener("click", () => {
+    startNewChat();
+    closeSidebarOnMobile();
   });
+
+  function highlightActiveConversation() {
+    conversationList.querySelectorAll(".conversation-item").forEach((item) => {
+      item.classList.toggle("active", item.dataset.id === currentConversationId);
+    });
+  }
+
+  function closeSidebarOnMobile() {
+    if (window.matchMedia("(max-width: 900px)").matches) {
+      sidebar.classList.remove("open");
+      sidebarBackdrop.classList.add("hidden");
+    }
+  }
+
+  sidebarToggle.addEventListener("click", () => {
+    if (window.matchMedia("(max-width: 900px)").matches) {
+      const opening = !sidebar.classList.contains("open");
+      sidebar.classList.toggle("open", opening);
+      sidebarBackdrop.classList.toggle("hidden", !opening);
+    } else {
+      sidebar.classList.toggle("collapsed");
+    }
+  });
+
+  sidebarBackdrop.addEventListener("click", closeSidebarOnMobile);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && sidebar.classList.contains("open")) closeSidebarOnMobile();
+  });
+
+  async function loadConversations() {
+    try {
+      const response = await fetch("/api/conversations");
+      if (!response.ok) return;
+      const { conversations } = await response.json();
+      renderConversationList(conversations);
+    } catch {
+      /* Non-fatal: the sidebar just stays empty. */
+    }
+  }
+
+  function renderConversationList(conversations) {
+    conversationList.innerHTML = "";
+    for (const conversation of conversations) {
+      const item = document.createElement("li");
+      item.className = "conversation-item";
+      item.dataset.id = conversation.id;
+
+      const title = document.createElement("span");
+      title.className = "conversation-title";
+      title.textContent = conversation.title;
+      title.title = conversation.title;
+      item.appendChild(title);
+
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "conversation-delete";
+      remove.setAttribute("aria-label", `Delete ${conversation.title}`);
+      remove.textContent = "🗑";
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        deleteConversation(conversation.id);
+      });
+      item.appendChild(remove);
+
+      item.addEventListener("click", () => {
+        if (item.classList.contains("renaming")) return;
+        openConversation(conversation.id);
+      });
+      item.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        beginRename(item, conversation, title);
+      });
+      conversationList.appendChild(item);
+    }
+    highlightActiveConversation();
+  }
+
+  function beginRename(item, conversation, titleNode) {
+    if (item.classList.contains("renaming")) return;
+    item.classList.add("renaming");
+    const input = document.createElement("input");
+    input.value = conversation.title;
+    input.maxLength = 200;
+    // Keep clicks/dblclicks inside the field from reaching the row handlers.
+    input.addEventListener("click", (event) => event.stopPropagation());
+    input.addEventListener("dblclick", (event) => event.stopPropagation());
+    titleNode.textContent = "";
+    titleNode.appendChild(input);
+    input.focus();
+    input.select();
+    let finished = false;
+    const finish = async (save) => {
+      if (finished) return;
+      finished = true;
+      const newTitle = input.value.trim();
+      if (save && newTitle && newTitle !== conversation.title) {
+        try {
+          await fetch(`/api/conversations/${conversation.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: newTitle }),
+          });
+        } catch {
+          toast("Could not rename the conversation.", "error", 6000);
+        }
+      }
+      loadConversations();
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") finish(true);
+      if (event.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
+
+  async function deleteConversation(id) {
+    if (isStreaming && id === currentConversationId) {
+      toast("Can't delete a conversation while it's still generating.", "error", 6000);
+      return;
+    }
+    if (!window.confirm("Delete this conversation? This cannot be undone.")) return;
+    try {
+      const response = await fetch(`/api/conversations/${id}`, { method: "DELETE" });
+      // A 404 means it's already gone — treat as success.
+      if (!response.ok && response.status !== 404) throw new Error();
+      if (id === currentConversationId) {
+        currentConversationId = null;
+        startNewChat();
+      }
+    } catch {
+      toast("Could not delete the conversation.", "error", 6000);
+    }
+    loadConversations();
+  }
+
+  function extractMessageText(content) {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      const part = content.find((entry) => entry?.type === "text");
+      return part?.text || "";
+    }
+    return "";
+  }
+
+  function renderConversationHistory() {
+    clearChatWindow();
+    for (const message of messages) {
+      if (message.role === "user") {
+        const bubble = appendMessage("user", message.display ?? extractMessageText(message.content));
+        const meta = Array.isArray(message.attachments_meta) ? message.attachments_meta : [];
+        if (meta.length) {
+          const tags = document.createElement("div");
+          tags.className = "message-attachments";
+          for (const entry of meta) {
+            if (entry.kind === "image" && typeof entry.dataUrl === "string"
+                && entry.dataUrl.startsWith("data:image/")) {
+              const thumb = document.createElement("img");
+              thumb.className = "msg-thumb";
+              thumb.src = entry.dataUrl;
+              thumb.alt = entry.name || "image";
+              tags.appendChild(thumb);
+            } else {
+              const tag = document.createElement("span");
+              tag.className = "doc-tag";
+              tag.textContent = `📄 ${entry.name}${entry.pages ? ` (${entry.pages} p.)` : ""}`;
+              tags.appendChild(tag);
+            }
+          }
+          bubble.prepend(tags);
+        }
+      } else if (message.role === "assistant") {
+        appendMessage("assistant", extractMessageText(message.content));
+      }
+    }
+    chatWindow.scrollTop = chatWindow.scrollHeight;
+  }
+
+  async function openConversation(id) {
+    if (isStreaming || id === currentConversationId) return;
+    try {
+      const response = await fetch(`/api/conversations/${id}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not load the conversation.");
+      messages = Array.isArray(data.messages) ? data.messages : [];
+      currentConversationId = id;
+      attachments = [];
+      renderAttachments();
+      renderConversationHistory();
+      highlightActiveConversation();
+      closeSidebarOnMobile();
+    } catch (error) {
+      toast(error.message || "Could not load the conversation.", "error", 6000);
+    }
+  }
+
+  async function ensureConversation() {
+    if (currentConversationId) return currentConversationId;
+    const created = await fetch("/api/conversations", { method: "POST" });
+    if (!created.ok) throw new Error("create failed");
+    currentConversationId = (await created.json()).id;
+    return currentConversationId;
+  }
+
+  async function persistConversation() {
+    if (!messages.length) return;
+    // Snapshot what we're saving and where, so a concurrent New-chat / open
+    // can't make us write the wrong messages into the wrong conversation.
+    const snapshot = JSON.stringify(messages);
+    try {
+      let targetId = await ensureConversation();
+      let response = await fetch(`/api/conversations/${targetId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: JSON.parse(snapshot) }),
+      });
+      // The active conversation was deleted (e.g. mid-stream): recreate it
+      // so the in-progress chat isn't silently lost.
+      if (response.status === 404 && targetId === currentConversationId) {
+        currentConversationId = null;
+        targetId = await ensureConversation();
+        response = await fetch(`/api/conversations/${targetId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: JSON.parse(snapshot) }),
+        });
+      }
+      if (!response.ok) throw new Error(`status ${response.status}`);
+      loadConversations();
+    } catch {
+      toast("This conversation could not be saved.", "error", 6000);
+    }
+  }
 
   // ---------- Streaming chat ----------
 
@@ -749,9 +1002,20 @@
             { type: "text", text: fullText },
           ]
         : fullText,
+      // Display-only fields for restoring saved conversations; the backend
+      // strips them before talking to LM Studio.
+      display: content,
+      attachments_meta: [
+        ...images.map((image) => ({ kind: "image", name: image.name, dataUrl: image.dataUrl })),
+        ...docs.map((doc) => ({ kind: "document", name: doc.name, pages: doc.pages })),
+      ],
     });
     attachments = [];
     renderAttachments();
+
+    // Persist the user turn before streaming so a reload/crash mid-generation
+    // doesn't lose the prompt (local models can stream for minutes).
+    persistConversation();
 
     const assistantBubble = appendMessage("assistant", "");
     assistantBubble.classList.add("pending");
@@ -872,6 +1136,7 @@
       isStreaming = false;
       updateSendState();
       messageInput.focus();
+      persistConversation();
     }
   }
 
@@ -880,5 +1145,6 @@
   loadDefaults();
   loadModels();
   checkImageCapability();
+  loadConversations();
   messageInput.focus();
 })();

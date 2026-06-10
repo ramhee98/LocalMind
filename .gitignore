@@ -4,6 +4,9 @@ config.json
 # TLS certificates (auto-generated snakeoil or user-provided)
 certs/
 
+# Local data (conversation database)
+data/
+
 # Python
 __pycache__/
 *.py[cod]

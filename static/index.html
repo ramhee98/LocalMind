@@ -7,9 +7,21 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <div class="layout" id="layout">
+    <div id="sidebar-backdrop" class="sidebar-backdrop hidden"></div>
+    <aside id="sidebar" class="sidebar" aria-label="Conversations">
+      <div class="sidebar-header">
+        <button id="new-chat" class="new-chat-button" type="button">＋ New chat</button>
+      </div>
+      <ul id="conversation-list" class="conversation-list"></ul>
+      <p class="sidebar-hint">Double-click a chat to rename it</p>
+    </aside>
+
   <div class="app">
     <header class="topbar">
       <div class="brand">
+        <button id="sidebar-toggle" class="icon-button" type="button"
+                title="Toggle conversation list" aria-label="Toggle conversation list">☰</button>
         <span class="brand-dot"></span>
         <h1>LocalMind</h1>
       </div>
@@ -137,6 +149,7 @@
                 aria-label="Message"></textarea>
       <button id="send-button" type="button" disabled>Send</button>
     </footer>
+  </div>
   </div>
 
   <div id="toast-container" class="toast-container" aria-live="polite"></div>

@@ -17,6 +17,13 @@ Image generation (OpenAI-compatible /images/generations, capability-detected):
 
 Document upload (text is extracted server-side and injected into the chat):
   * POST /api/upload             -> extract text from an uploaded PDF
+
+Conversation persistence (SQLite, server-side):
+  * GET    /api/conversations      -> list conversations (newest first)
+  * POST   /api/conversations      -> create an empty conversation
+  * GET    /api/conversations/{id} -> full message history
+  * PUT    /api/conversations/{id} -> save messages and/or rename
+  * DELETE /api/conversations/{id} -> delete
 """
 
 from __future__ import annotations
@@ -26,11 +33,15 @@ import io
 import json
 import logging
 import os
+import sqlite3
+import uuid
+from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
 
 import httpx
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
@@ -47,6 +58,8 @@ STATIC_DIR = BASE_DIR / "static"
 CONFIG_FILE = Path(os.environ.get("LOCALMIND_CONFIG") or BASE_DIR / "config.json")
 CONFIG_TEMPLATE_FILE = BASE_DIR / "config.template.json"
 CERTS_DIR = BASE_DIR / "certs"
+DATA_DIR = BASE_DIR / "data"
+DB_FILE = DATA_DIR / "localmind.db"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "lm_studio_base_url": "http://localhost:1234/v1",
@@ -210,6 +223,155 @@ def get_config() -> dict[str, Any]:
         "documents": CONFIG["documents"],
         "base_url": CONFIG["lm_studio_base_url"],
     }
+
+
+# ---------- Conversation persistence ----------
+
+def db_connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_db() -> None:
+    with closing(db_connect()) as connection, connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS conversations (
+                   id TEXT PRIMARY KEY,
+                   title TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,
+                   messages_json TEXT NOT NULL DEFAULT '[]'
+               )""")
+
+
+init_db()
+
+
+# Bound the persisted payload so an unauthenticated PUT can't OOM the process
+# or fill the disk; base64 image attachments are stored inline, so this is
+# generous but finite.
+MAX_CONVERSATION_BYTES = 32 * 1024 * 1024
+MAX_CONVERSATION_MESSAGES = 2000
+
+
+class ConversationUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    messages: Optional[list[dict[str, Any]]] = Field(
+        default=None, max_length=MAX_CONVERSATION_MESSAGES)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def message_text(message: dict[str, Any]) -> str:
+    """Best-effort plain text of a stored message (display field, text, or part)."""
+    display = message.get("display")
+    if isinstance(display, str) and display.strip():
+        return display
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                return str(part.get("text") or "")
+    return ""
+
+
+def derive_title(messages: list[dict[str, Any]]) -> Optional[str]:
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        text = " ".join(message_text(message).split())
+        if text:
+            return text[:60] + ("…" if len(text) > 60 else "")
+    return None
+
+
+@app.get("/api/conversations")
+def list_conversations() -> dict[str, Any]:
+    with closing(db_connect()) as connection:
+        rows = connection.execute(
+            "SELECT id, title, created_at, updated_at FROM conversations "
+            "ORDER BY updated_at DESC").fetchall()
+    return {"conversations": [dict(row) for row in rows]}
+
+
+@app.post("/api/conversations")
+def create_conversation() -> dict[str, Any]:
+    conversation_id = uuid.uuid4().hex
+    now = utc_now()
+    with closing(db_connect()) as connection, connection:
+        connection.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) "
+            "VALUES (?, 'New chat', ?, ?)",
+            (conversation_id, now, now))
+    logger.info("Created conversation %s", conversation_id)
+    return {"id": conversation_id, "title": "New chat"}
+
+
+@app.get("/api/conversations/{conversation_id}")
+def get_conversation(conversation_id: str) -> JSONResponse:
+    with closing(db_connect()) as connection:
+        row = connection.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "Conversation not found."})
+    try:
+        messages = json.loads(row["messages_json"])
+    except json.JSONDecodeError:
+        logger.error("Corrupt messages_json in conversation %s", conversation_id)
+        messages = []
+    return JSONResponse(content={
+        "id": row["id"], "title": row["title"], "messages": messages,
+    })
+
+
+@app.put("/api/conversations/{conversation_id}")
+async def update_conversation(conversation_id: str, http_request: Request) -> JSONResponse:
+    raw = await http_request.body()
+    if len(raw) > MAX_CONVERSATION_BYTES:
+        return JSONResponse(status_code=413, content={
+            "error": f"Conversation too large "
+                     f"(limit {MAX_CONVERSATION_BYTES // 1024 // 1024} MB)."})
+    try:
+        request = ConversationUpdate.model_validate_json(raw)
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"error": str(exc)})
+    with closing(db_connect()) as connection, connection:
+        row = connection.execute(
+            "SELECT title FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "Conversation not found."})
+        title = request.title or row["title"]
+        if request.messages is not None:
+            # Auto-title untitled conversations from their first user message.
+            if not request.title and row["title"] == "New chat":
+                title = derive_title(request.messages) or title
+            connection.execute(
+                "UPDATE conversations SET messages_json = ?, title = ?, updated_at = ? "
+                "WHERE id = ?",
+                (json.dumps(request.messages), title, utc_now(), conversation_id))
+        else:
+            connection.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                (title, utc_now(), conversation_id))
+    return JSONResponse(content={"id": conversation_id, "title": title})
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def delete_conversation(conversation_id: str) -> JSONResponse:
+    with closing(db_connect()) as connection, connection:
+        deleted = connection.execute(
+            "DELETE FROM conversations WHERE id = ?", (conversation_id,)).rowcount
+    if not deleted:
+        return JSONResponse(status_code=404, content={"error": "Conversation not found."})
+    logger.info("Deleted conversation %s", conversation_id)
+    return JSONResponse(content={"status": "deleted", "id": conversation_id})
 
 
 # ---------- Document upload ----------

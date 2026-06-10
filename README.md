@@ -18,6 +18,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **File attachments (📎 / drag & drop)** — attach PDFs, plain-text, and code files; their text is extracted server-side and injected into the chat context so you can ask questions about them. Limits are configurable, with clear errors for password-protected or scanned PDFs.
 - **Image attachments & pasted screenshots** — attach images via the picker, drag & drop, or simply paste a screenshot (Cmd+V); they are sent to vision-capable models (like Gemma) as multimodal input.
 - **Thinking control** — a settings option to turn model reasoning off/low/high per conversation; when a model thinks, the thought stream renders live in a collapsible 💭 block that folds away once the answer starts.
+- **Saved conversations** — every chat is persisted server-side (SQLite) and listed in a sidebar; reload-safe, multi-device over the LAN, with rename and delete. The user turn is saved before streaming begins, so nothing is lost mid-generation.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -120,6 +121,17 @@ Then open <http://localhost:8000> in your browser.
 4. Watch the response stream in token-by-token. Use 🗑 to start a fresh conversation.
 
 If LM Studio is not running, a banner explains the problem and offers a **Retry** button.
+
+### Conversations (saved automatically)
+
+Conversations are persisted server-side in a SQLite database under `data/` (gitignored), so they survive reloads, crashes, and closing the tab — and because the app can bind `0.0.0.0`, the same history is reachable from any device on your LAN.
+
+- The ☰ button toggles a sidebar listing past conversations, newest first.
+- The first exchange of a new chat auto-creates and auto-titles a conversation (from your first message); the user turn is saved *before* the model starts streaming, so nothing is lost if you reload mid-generation.
+- Click a conversation to resume it (messages, image thumbnails, and document tags are restored); **double-click** to rename; the 🗑 on each row deletes it (with confirmation).
+- The topbar 🗑 starts a fresh chat without deleting anything.
+
+> The conversation endpoints are unauthenticated, like the rest of the app. On a trusted home LAN this is usually fine; if your network is shared, bind to `127.0.0.1` (set `host` in `config.json`) or put LocalMind behind an authenticating reverse proxy. Stored conversations include uploaded document text and pasted images.
 
 ### Attaching files and images
 
@@ -228,6 +240,11 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | `GET` | `/api/models` | Loaded LLM instances (chat model dropdown source) |
 | `POST` | `/api/chat` | Streaming chat completion (SSE; supports multimodal content and `reasoning_effort`) |
 | `POST` | `/api/upload` | Extract text from a PDF/text/code file (multipart form) |
+| `GET` | `/api/conversations` | List saved conversations (newest first) |
+| `POST` | `/api/conversations` | Create an empty conversation |
+| `GET` | `/api/conversations/{id}` | Full message history of a conversation |
+| `PUT` | `/api/conversations/{id}` | Save messages and/or rename: `{"messages"?, "title"?}` |
+| `DELETE` | `/api/conversations/{id}` | Delete a conversation |
 | `GET` | `/api/models/manage` | All downloaded models with load state and details |
 | `POST` | `/api/models/load` | Load a model: `{"model", "ttl_seconds"?, "context_length"?}` |
 | `POST` | `/api/models/unload` | Unload one instance: `{"instance_id"}` |
