@@ -25,6 +25,7 @@ import copy
 import io
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
 
@@ -42,8 +43,10 @@ logger = logging.getLogger("localmind")
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-CONFIG_FILE = BASE_DIR / "config.json"
+# LOCALMIND_CONFIG overrides the config path (useful for Docker and tests).
+CONFIG_FILE = Path(os.environ.get("LOCALMIND_CONFIG") or BASE_DIR / "config.json")
 CONFIG_TEMPLATE_FILE = BASE_DIR / "config.template.json"
+CERTS_DIR = BASE_DIR / "certs"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "lm_studio_base_url": "http://localhost:1234/v1",
@@ -72,6 +75,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "documents": {
         "max_file_size_mb": 25,
         "max_text_chars": 20000,
+    },
+    "tls": {
+        "enabled": False,
+        "cert_file": None,
+        "key_file": None,
     },
 }
 
@@ -625,7 +633,119 @@ def chat(request: ChatRequest) -> StreamingResponse:
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+# ---------- TLS ----------
+
+SNAKEOIL_CERT = CERTS_DIR / "snakeoil.crt"
+SNAKEOIL_KEY = CERTS_DIR / "snakeoil.key"
+SNAKEOIL_VALIDITY_DAYS = 825
+
+
+def generate_snakeoil_cert(cert_path: Path, key_path: Path) -> None:
+    """Create a self-signed certificate for localhost/LAN use."""
+    import datetime
+    import ipaddress
+    import socket
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "LocalMind (self-signed)"),
+    ])
+    san_entries: list[x509.GeneralName] = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+        x509.IPAddress(ipaddress.ip_address("::1")),
+    ]
+    hostname = socket.gethostname()
+    if hostname and hostname != "localhost":
+        san_entries.append(x509.DNSName(hostname))
+        if not hostname.endswith(".local"):
+            san_entries.append(x509.DNSName(f"{hostname}.local"))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=SNAKEOIL_VALIDITY_DAYS))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ))
+    os.chmod(key_path, 0o600)
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    logger.info("Generated self-signed certificate %s (valid %s days)",
+                cert_path, SNAKEOIL_VALIDITY_DAYS)
+
+
+def snakeoil_cert_is_usable() -> bool:
+    """True if the existing snakeoil cert parses and is not about to expire."""
+    import datetime
+
+    from cryptography import x509
+
+    if not (SNAKEOIL_CERT.is_file() and SNAKEOIL_KEY.is_file()):
+        return False
+    try:
+        certificate = x509.load_pem_x509_certificate(SNAKEOIL_CERT.read_bytes())
+    except (ValueError, OSError):
+        return False
+    expiry = getattr(certificate, "not_valid_after_utc", None)
+    if expiry is None:
+        expiry = certificate.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+    return expiry > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
+
+
+def resolve_tls_files() -> Optional[tuple[str, str]]:
+    """Return (cert_file, key_file) when TLS is enabled, else None.
+
+    Explicitly configured paths are validated and never silently replaced;
+    with no paths configured, a snakeoil certificate is (re)generated.
+    """
+    tls = CONFIG["tls"]
+    if not tls["enabled"]:
+        return None
+    cert_file, key_file = tls["cert_file"], tls["key_file"]
+    if cert_file or key_file:
+        if not (cert_file and key_file):
+            raise SystemExit("TLS misconfiguration: cert_file and key_file "
+                             "must both be set (or both left null for a "
+                             "self-signed certificate).")
+        # Relative paths resolve against the project directory, not the cwd.
+        cert_path = Path(cert_file) if Path(cert_file).is_absolute() else BASE_DIR / cert_file
+        key_path = Path(key_file) if Path(key_file).is_absolute() else BASE_DIR / key_file
+        if not (cert_path.is_file() and key_path.is_file()):
+            raise SystemExit(f"TLS misconfiguration: {cert_path} or {key_path} "
+                             "does not exist.")
+        return str(cert_path), str(key_path)
+    if not snakeoil_cert_is_usable():
+        logger.warning("No TLS certificate configured — generating a "
+                       "self-signed (snakeoil) certificate. Browsers will "
+                       "show a security warning.")
+        generate_snakeoil_cert(SNAKEOIL_CERT, SNAKEOIL_KEY)
+    return str(SNAKEOIL_CERT), str(SNAKEOIL_KEY)
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"])
+    ssl_kwargs: dict[str, Any] = {}
+    tls_files = resolve_tls_files()
+    if tls_files:
+        ssl_kwargs = {"ssl_certfile": tls_files[0], "ssl_keyfile": tls_files[1]}
+        logger.info("HTTPS enabled on https://%s:%s (cert: %s)",
+                    CONFIG["host"], CONFIG["port"], tls_files[0])
+    uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"], **ssl_kwargs)

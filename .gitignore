@@ -1,6 +1,9 @@
 # Local configuration (copy config.template.json -> config.json)
 config.json
 
+# TLS certificates (auto-generated snakeoil or user-provided)
+certs/
+
 # Python
 __pycache__/
 *.py[cod]
