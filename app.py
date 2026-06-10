@@ -1,9 +1,15 @@
 """LocalMind — a lightweight chat interface for a local LM Studio server.
 
 FastAPI backend that proxies the LM Studio OpenAI-compatible API:
-  * GET  /api/config  -> default generation parameters for the UI
-  * GET  /api/models  -> models currently loaded/available in LM Studio
-  * POST /api/chat    -> streaming chat completion (Server-Sent Events)
+  * GET  /api/config             -> default generation parameters for the UI
+  * GET  /api/models             -> models currently loaded/available in LM Studio
+  * POST /api/chat               -> streaming chat completion (Server-Sent Events)
+
+and the LM Studio native REST API for model lifecycle management:
+  * GET  /api/models/manage      -> all downloaded models with load state and details
+  * POST /api/models/load        -> load a model (optional idle TTL and context length)
+  * POST /api/models/unload      -> unload a single loaded instance
+  * POST /api/models/unload-all  -> unload every loaded instance
 """
 
 from __future__ import annotations
@@ -12,8 +18,9 @@ import copy
 import json
 import logging
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -39,13 +46,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_tokens": 1024,
         "system_prompt": "You are a helpful assistant.",
     },
+    "model_management": {
+        "default_ttl_seconds": 600,
+        "auto_unload_by_default": True,
+        "default_context_length": None,
+        "load_timeout_seconds": 600,
+        "status_refresh_seconds": 10,
+    },
 }
 
 
 def load_config() -> dict[str, Any]:
     """Load config.json, falling back to config.template.json, then built-in defaults.
 
-    Loaded values are merged over the defaults so a partial config file is valid.
+    Loaded values are merged over the defaults (one level deep for nested
+    sections) so a partial config file is valid.
     """
     config = copy.deepcopy(DEFAULT_CONFIG)
     for path in (CONFIG_FILE, CONFIG_TEMPLATE_FILE):
@@ -63,9 +78,11 @@ def load_config() -> dict[str, Any]:
         if path is CONFIG_TEMPLATE_FILE:
             logger.warning("config.json not found — using config.template.json. "
                            "Copy it to config.json to customize your setup.")
-        defaults = {**config["defaults"], **loaded.get("defaults", {})}
-        config.update(loaded)
-        config["defaults"] = defaults
+        for key, value in loaded.items():
+            if isinstance(value, dict) and isinstance(config.get(key), dict):
+                config[key] = {**config[key], **value}
+            else:
+                config[key] = value
         logger.info("Configuration loaded from %s", path.name)
         return config
     logger.warning("No config file found — using built-in defaults.")
@@ -80,7 +97,17 @@ client = OpenAI(
     timeout=CONFIG["request_timeout_seconds"],
 )
 
-app = FastAPI(title="LocalMind", version="1.0.0")
+# The model management endpoints live on LM Studio's native REST API at the
+# server root (e.g. http://localhost:1234/api/v1), not under the
+# OpenAI-compatible /v1 prefix.
+LM_SERVER_ROOT = CONFIG["lm_studio_base_url"].rstrip("/").removesuffix("/v1")
+
+native_client = httpx.Client(
+    base_url=LM_SERVER_ROOT,
+    timeout=CONFIG["request_timeout_seconds"],
+)
+
+app = FastAPI(title="LocalMind", version="1.1.0")
 
 
 class ChatMessage(BaseModel):
@@ -93,6 +120,16 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     temperature: float = Field(default=CONFIG["defaults"]["temperature"], ge=0.0, le=2.0)
     max_tokens: int = Field(default=CONFIG["defaults"]["max_tokens"], ge=1, le=131072)
+
+
+class LoadModelRequest(BaseModel):
+    model: str = Field(min_length=1)
+    ttl_seconds: Optional[int] = Field(default=None, ge=1, le=86400 * 7)
+    context_length: Optional[int] = Field(default=None, ge=1, le=10_000_000)
+
+
+class UnloadModelRequest(BaseModel):
+    instance_id: str = Field(min_length=1)
 
 
 def connection_error_payload() -> dict[str, str]:
@@ -113,11 +150,51 @@ def index() -> FileResponse:
 @app.get("/api/config")
 def get_config() -> dict[str, Any]:
     """Expose only UI-relevant defaults — never the full server config."""
-    return {"defaults": CONFIG["defaults"], "base_url": CONFIG["lm_studio_base_url"]}
+    return {
+        "defaults": CONFIG["defaults"],
+        "model_management": CONFIG["model_management"],
+        "base_url": CONFIG["lm_studio_base_url"],
+    }
+
+
+def fetch_native_models() -> list[dict[str, Any]]:
+    """Return the raw model list from LM Studio's native REST API."""
+    response = native_client.get("/api/v1/models")
+    response.raise_for_status()
+    return response.json().get("models", [])
+
+
+def native_error_message(response: httpx.Response) -> str:
+    """Extract a human-readable message from a native API error response."""
+    try:
+        error = response.json().get("error", {})
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if isinstance(error, str):
+            return error
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return f"LM Studio returned HTTP {response.status_code}."
 
 
 @app.get("/api/models")
 def list_models() -> JSONResponse:
+    """Models selectable for chat: loaded LLM instances (chat dropdown source).
+
+    Prefers the native API so embedding models are excluded; falls back to the
+    OpenAI-compatible listing if the native API is unavailable.
+    """
+    try:
+        models = sorted(
+            instance["id"]
+            for model in fetch_native_models()
+            if model.get("type") != "embedding"
+            for instance in model.get("loaded_instances", [])
+            if instance.get("id")
+        )
+        return JSONResponse(content={"models": models})
+    except (httpx.HTTPError, ValueError):
+        logger.warning("Native model list unavailable, falling back to OpenAI-compatible API.")
     try:
         models = sorted(model.id for model in client.models.list())
     except (APIConnectionError, APITimeoutError):
@@ -127,6 +204,110 @@ def list_models() -> JSONResponse:
         logger.exception("LM Studio returned an error while listing models")
         return JSONResponse(status_code=502, content={"error": f"LM Studio error: {exc.message}"})
     return JSONResponse(content={"models": models})
+
+
+@app.get("/api/models/manage")
+def manage_models() -> JSONResponse:
+    """All downloaded models with their load state, for the management panel."""
+    try:
+        raw_models = fetch_native_models()
+    except (httpx.ConnectError, httpx.TimeoutException):
+        logger.exception("LM Studio unreachable while fetching model status")
+        return JSONResponse(status_code=502, content=connection_error_payload())
+    except httpx.HTTPStatusError as exc:
+        logger.exception("LM Studio returned an error while fetching model status")
+        return JSONResponse(status_code=502, content={"error": native_error_message(exc.response)})
+
+    models = [
+        {
+            "key": model.get("key"),
+            "display_name": model.get("display_name") or model.get("key"),
+            "type": model.get("type"),
+            "params": model.get("params_string"),
+            "quantization": (model.get("quantization") or {}).get("name"),
+            "size_bytes": model.get("size_bytes"),
+            "max_context_length": model.get("max_context_length"),
+            "loaded_instances": [
+                {
+                    "id": instance.get("id"),
+                    "context_length": (instance.get("config") or {}).get("context_length"),
+                }
+                for instance in model.get("loaded_instances", [])
+            ],
+        }
+        for model in raw_models
+        if model.get("key")
+    ]
+    return JSONResponse(content={"models": models})
+
+
+@app.post("/api/models/load")
+def load_model(request: LoadModelRequest) -> JSONResponse:
+    payload: dict[str, Any] = {"model": request.model}
+    if request.ttl_seconds is not None:
+        payload["ttl_seconds"] = request.ttl_seconds
+    if request.context_length is not None:
+        payload["context_length"] = request.context_length
+    try:
+        response = native_client.post(
+            "/api/v1/models/load",
+            json=payload,
+            timeout=CONFIG["model_management"]["load_timeout_seconds"],
+        )
+    except (httpx.ConnectError, httpx.TimeoutException):
+        logger.exception("LM Studio unreachable while loading %s", request.model)
+        return JSONResponse(status_code=502, content=connection_error_payload())
+    if response.is_error:
+        logger.error("Failed to load %s: %s", request.model, response.text)
+        return JSONResponse(status_code=502, content={"error": native_error_message(response)})
+    logger.info("Loaded model %s (ttl=%s, context_length=%s)",
+                request.model, request.ttl_seconds, request.context_length)
+    return JSONResponse(content=response.json())
+
+
+def unload_instance(instance_id: str) -> Optional[str]:
+    """Unload one instance; return an error message or None on success."""
+    try:
+        response = native_client.post("/api/v1/models/unload", json={"instance_id": instance_id})
+    except (httpx.ConnectError, httpx.TimeoutException):
+        logger.exception("LM Studio unreachable while unloading %s", instance_id)
+        return connection_error_payload()["error"]
+    if response.is_error:
+        logger.error("Failed to unload %s: %s", instance_id, response.text)
+        return native_error_message(response)
+    logger.info("Unloaded model instance %s", instance_id)
+    return None
+
+
+@app.post("/api/models/unload")
+def unload_model(request: UnloadModelRequest) -> JSONResponse:
+    error = unload_instance(request.instance_id)
+    if error:
+        return JSONResponse(status_code=502, content={"error": error})
+    return JSONResponse(content={"status": "unloaded", "instance_id": request.instance_id})
+
+
+@app.post("/api/models/unload-all")
+def unload_all_models() -> JSONResponse:
+    try:
+        raw_models = fetch_native_models()
+    except (httpx.HTTPError, ValueError):
+        logger.exception("LM Studio unreachable while listing models for unload-all")
+        return JSONResponse(status_code=502, content=connection_error_payload())
+
+    unloaded: list[str] = []
+    errors: list[str] = []
+    for model in raw_models:
+        for instance in model.get("loaded_instances", []):
+            instance_id = instance.get("id")
+            if not instance_id:
+                continue
+            error = unload_instance(instance_id)
+            if error:
+                errors.append(f"{instance_id}: {error}")
+            else:
+                unloaded.append(instance_id)
+    return JSONResponse(content={"unloaded": unloaded, "errors": errors})
 
 
 def stream_completion(request: ChatRequest) -> Iterator[str]:
