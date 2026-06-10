@@ -26,6 +26,9 @@
   const ttlSecondsInput = document.getElementById("ttl-seconds");
   const contextLengthInput = document.getElementById("context-length");
   const toastContainer = document.getElementById("toast-container");
+  const composer = document.getElementById("composer");
+  const imageToggle = document.getElementById("image-toggle");
+  const imageSizeSelect = document.getElementById("image-size");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -33,6 +36,9 @@
   let isStreaming = false;
   let statusRefreshSeconds = 10;
   let statusRefreshTimer = null;
+  let imageMode = false;
+  let imageGenSupported = false;
+  let imageGenDetail = "";
   /** Model keys / instance ids with an in-flight load or unload request. */
   const busyModels = new Set();
 
@@ -78,7 +84,8 @@
     try {
       const response = await fetch("/api/config");
       if (!response.ok) return;
-      const { defaults, model_management: management } = await response.json();
+      const data = await response.json();
+      const { defaults, model_management: management } = data;
       temperatureInput.value = defaults.temperature;
       temperatureValue.textContent = Number(defaults.temperature).toFixed(2);
       maxTokensInput.value = defaults.max_tokens;
@@ -90,6 +97,16 @@
           contextLengthInput.value = management.default_context_length;
         }
         statusRefreshSeconds = management.status_refresh_seconds || 10;
+      }
+      const defaultSize = data.image_generation?.default_size;
+      if (defaultSize) {
+        if (![...imageSizeSelect.options].some((o) => o.value === defaultSize)) {
+          const option = document.createElement("option");
+          option.value = defaultSize;
+          option.textContent = defaultSize.replace("x", " × ");
+          imageSizeSelect.appendChild(option);
+        }
+        imageSizeSelect.value = defaultSize;
       }
     } catch {
       /* Non-fatal: the UI falls back to its hardcoded defaults. */
@@ -374,7 +391,84 @@
 
   function updateSendState() {
     sendButton.disabled =
-      isStreaming || !modelSelect.value || !messageInput.value.trim();
+      isStreaming || !messageInput.value.trim() || (!imageMode && !modelSelect.value);
+    sendButton.textContent = imageMode ? "Generate" : "Send";
+  }
+
+  // ---------- Image generation ----------
+
+  async function checkImageCapability() {
+    try {
+      const response = await fetch("/api/images/capability");
+      const data = await response.json();
+      imageGenSupported = Boolean(data.supported);
+      imageGenDetail = data.detail || "";
+    } catch {
+      imageGenSupported = false;
+      imageGenDetail = "Could not determine image generation support.";
+    }
+    imageToggle.classList.remove("hidden");
+    imageToggle.classList.toggle("unsupported", !imageGenSupported);
+    imageToggle.title = imageGenSupported
+      ? "Image generation mode"
+      : `Image generation unavailable — ${imageGenDetail}`;
+  }
+
+  function setImageMode(on) {
+    imageMode = on;
+    imageToggle.classList.toggle("active", on);
+    composer.classList.toggle("image-mode", on);
+    messageInput.placeholder = on
+      ? "Describe the image to generate… (Enter to generate)"
+      : "Type a message… (Enter to send, Shift+Enter for a new line)";
+    updateSendState();
+  }
+
+  imageToggle.addEventListener("click", () => {
+    if (!imageGenSupported) {
+      toast(imageGenDetail || "Image generation is not supported by the connected server.",
+            "error", 9000);
+      return;
+    }
+    setImageMode(!imageMode);
+  });
+
+  async function sendImageMessage(prompt) {
+    appendMessage("user", prompt);
+    const bubble = appendMessage("assistant", "Generating image…");
+    bubble.classList.add("pending");
+    try {
+      const response = await fetch("/api/images", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, size: imageSizeSelect.value, n: 1 }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Image generation failed.");
+      bubble.textContent = "";
+      bubble.classList.add("image");
+      data.images.forEach((src, index) => {
+        const img = document.createElement("img");
+        img.src = src;
+        img.alt = prompt;
+        img.addEventListener("click", () => img.classList.toggle("expanded"));
+        const download = document.createElement("a");
+        download.href = src;
+        download.download = `localmind-${Date.now()}-${index + 1}.png`;
+        download.textContent = "⬇ Download";
+        download.className = "image-download";
+        bubble.append(img, download);
+      });
+      chatWindow.scrollTop = chatWindow.scrollHeight;
+    } catch (error) {
+      bubble.remove();
+      showError(error.message || "Image generation failed.");
+    } finally {
+      bubble.classList.remove("pending");
+      isStreaming = false;
+      updateSendState();
+      messageInput.focus();
+    }
   }
 
   messageInput.addEventListener("input", () => {
@@ -403,13 +497,20 @@
 
   async function sendMessage() {
     const content = messageInput.value.trim();
-    if (!content || isStreaming || !modelSelect.value) return;
+    if (!content || isStreaming || (!imageMode && !modelSelect.value)) return;
 
     hideError();
     isStreaming = true;
     messageInput.value = "";
     messageInput.style.height = "auto";
     updateSendState();
+
+    if (imageMode) {
+      // Image prompts are handled separately and intentionally kept out of
+      // the text-chat history sent to the LLM.
+      await sendImageMessage(content);
+      return;
+    }
 
     appendMessage("user", content);
     messages.push({ role: "user", content });
@@ -492,5 +593,6 @@
 
   loadDefaults();
   loadModels();
+  checkImageCapability();
   messageInput.focus();
 })();

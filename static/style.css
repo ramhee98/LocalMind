@@ -503,6 +503,56 @@ input[type="number"] {
 
 @keyframes blink { 50% { opacity: 0; } }
 
+/* ---------- Image generation ---------- */
+
+.icon-button.active {
+  border-color: var(--accent);
+  background: rgba(108, 140, 255, 0.15);
+  box-shadow: 0 0 8px rgba(108, 140, 255, 0.35);
+}
+
+.icon-button.unsupported {
+  opacity: 0.4;
+}
+
+.composer.image-mode #message-input {
+  border-color: var(--accent);
+}
+
+.message.assistant.image {
+  padding: 8px;
+  max-width: min(78%, 560px);
+}
+
+.message.assistant.image img {
+  display: block;
+  width: 100%;
+  border-radius: 10px;
+  cursor: zoom-in;
+}
+
+.message.assistant.image img.expanded {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: auto;
+  max-width: 94vw;
+  max-height: 94vh;
+  z-index: 90;
+  cursor: zoom-out;
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.7);
+}
+
+.image-download {
+  display: inline-block;
+  margin: 8px 4px 2px;
+  font-size: 0.78rem;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.image-download:hover { text-decoration: underline; }
+
 /* ---------- Composer ---------- */
 
 .composer {

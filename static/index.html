@@ -48,6 +48,16 @@
         <label for="max-tokens">Max tokens</label>
         <input type="number" id="max-tokens" min="1" max="131072" step="1" value="1024">
       </div>
+      <div class="setting">
+        <label for="image-size">Image size</label>
+        <select id="image-size">
+          <option value="512x512">512 × 512</option>
+          <option value="768x768">768 × 768</option>
+          <option value="1024x1024" selected>1024 × 1024</option>
+          <option value="1024x1536">1024 × 1536 (portrait)</option>
+          <option value="1536x1024">1536 × 1024 (landscape)</option>
+        </select>
+      </div>
     </aside>
 
     <aside id="models-panel" class="models-panel hidden" aria-label="Model management">
@@ -87,7 +97,9 @@
       </div>
     </main>
 
-    <footer class="composer">
+    <footer class="composer" id="composer">
+      <button id="image-toggle" class="icon-button hidden" type="button"
+              title="Image generation mode" aria-label="Toggle image generation mode">🎨</button>
       <textarea id="message-input" rows="1"
                 placeholder="Type a message… (Enter to send, Shift+Enter for a new line)"
                 aria-label="Message"></textarea>
