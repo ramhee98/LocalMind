@@ -21,6 +21,8 @@
             <option value="">Loading models…</option>
           </select>
         </label>
+        <button id="models-toggle" class="icon-button" type="button"
+                title="Manage models" aria-label="Toggle model management panel">📦</button>
         <button id="settings-toggle" class="icon-button" type="button"
                 title="Settings" aria-label="Toggle settings panel">⚙</button>
         <button id="clear-chat" class="icon-button" type="button"
@@ -48,6 +50,37 @@
       </div>
     </aside>
 
+    <aside id="models-panel" class="models-panel hidden" aria-label="Model management">
+      <div class="models-panel-header">
+        <h2>Model Management</h2>
+        <div class="models-panel-actions">
+          <button id="models-refresh" class="small-button" type="button">↻ Refresh</button>
+          <button id="unload-all" class="small-button danger" type="button">Unload all</button>
+        </div>
+      </div>
+
+      <div class="load-options">
+        <label class="load-option checkbox-option">
+          <input type="checkbox" id="ttl-enabled" checked>
+          Auto-unload after idle
+        </label>
+        <label class="load-option">
+          TTL (seconds)
+          <input type="number" id="ttl-seconds" min="1" step="1" value="600">
+        </label>
+        <label class="load-option">
+          Context length
+          <input type="number" id="context-length" min="1" step="1"
+                 placeholder="model default">
+        </label>
+      </div>
+
+      <ul id="models-list" class="models-list">
+        <li class="models-placeholder">Loading model status…</li>
+      </ul>
+      <p id="models-summary" class="models-summary"></p>
+    </aside>
+
     <main id="chat-window" class="chat-window" aria-live="polite">
       <div id="empty-state" class="empty-state">
         <p>👋 Select a model and start chatting with your local LLM.</p>
@@ -61,6 +94,8 @@
       <button id="send-button" type="button" disabled>Send</button>
     </footer>
   </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
   <script src="/static/script.js"></script>
 </body>
