@@ -13,6 +13,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
   - **live status** — loaded/not-loaded badges, parameter count, quantization, on-disk size, max context, and an estimate of memory in use, auto-refreshed while the panel is open,
   - **multiple instances** — load a model more than once and unload each instance individually,
   - **unload all** — free all memory with one click.
+- **Image generation (capability-detected)** — a 🎨 mode in the composer that generates images from text prompts via an OpenAI-compatible `/images/generations` endpoint. The UI detects automatically whether the connected server supports it; generated images render in the chat with click-to-zoom and a download link, and the image size is adjustable in settings.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -79,6 +80,10 @@ cp config.template.json config.json
 | `model_management.default_context_length` | Default context length for loads (`null` = model default) | `null` |
 | `model_management.load_timeout_seconds` | How long to wait for a model load to complete | `600` |
 | `model_management.status_refresh_seconds` | Auto-refresh interval of the model panel while open | `10` |
+| `image_generation.api_base_url` | OpenAI-compatible image API base URL (`null` = use `lm_studio_base_url`) | `null` |
+| `image_generation.model` | Model name sent to the image API (`null` = let the server choose) | `null` |
+| `image_generation.default_size` | Initial image size in the UI | `1024x1024` |
+| `image_generation.timeout_seconds` | Timeout for image generation requests | `300` |
 
 `config.json` is gitignored, so your local settings never end up in version control. If it is missing, the app falls back to `config.template.json`, and finally to built-in defaults.
 
@@ -120,6 +125,26 @@ The chat model dropdown always reflects the currently loaded LLM instances and r
 
 > Model management uses LM Studio's native REST API (`/api/v1/models`), which requires a recent LM Studio version. Chat keeps working through the OpenAI-compatible API even if the native API is unavailable.
 
+### Generating images
+
+Click the 🎨 button in the composer to switch to image mode, describe the image, and press **Enter** — the result appears in the chat (click to zoom, ⬇ to download). Pick the output size in the ⚙ settings panel.
+
+The button activates only when the connected server actually supports image generation, which is detected at startup by probing the OpenAI-compatible `/images/generations` endpoint:
+
+- **LM Studio does not currently support image generation** (its models are text/vision-input only), so against a plain LM Studio setup the 🎨 button stays greyed out and explains why when clicked.
+- To enable it, run an OpenAI-compatible image server (e.g. [LocalAI](https://localai.io/) with a Stable Diffusion backend, or any gateway exposing `/v1/images/generations`) and point `image_generation.api_base_url` at it in `config.json`, e.g.:
+
+```json
+"image_generation": {
+  "api_base_url": "http://localhost:8080/v1",
+  "model": "stablediffusion",
+  "default_size": "1024x1024",
+  "timeout_seconds": 300
+}
+```
+
+Chat continues to use LM Studio regardless — the image API is fully independent. Image prompts are not added to the LLM chat history.
+
 ## Deployment Notes
 
 The app is a standard ASGI application and runs anywhere uvicorn does.
@@ -156,6 +181,8 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | `POST` | `/api/models/load` | Load a model: `{"model", "ttl_seconds"?, "context_length"?}` |
 | `POST` | `/api/models/unload` | Unload one instance: `{"instance_id"}` |
 | `POST` | `/api/models/unload-all` | Unload every loaded instance |
+| `GET` | `/api/images/capability` | Whether the image API supports generation (`?refresh=true` re-probes) |
+| `POST` | `/api/images` | Generate image(s): `{"prompt", "size"?, "n"?}` |
 
 ## License
 
