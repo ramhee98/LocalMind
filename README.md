@@ -19,6 +19,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Image attachments & pasted screenshots** — attach images via the picker, drag & drop, or simply paste a screenshot (Cmd+V); they are sent to vision-capable models (like Gemma) as multimodal input.
 - **Thinking control** — a settings option to turn model reasoning off/low/high per conversation; when a model thinks, the thought stream renders live in a collapsible 💭 block that folds away once the answer starts.
 - **Saved conversations** — every chat is persisted server-side (SQLite) and listed in a sidebar; reload-safe, multi-device over the LAN, with rename and delete. The user turn is saved before streaming begins, so nothing is lost mid-generation.
+- **Document retrieval (RAG)** — long uploads are chunked, embedded with a local embedding model, and queried by relevance per question (only the top matches enter the prompt) — so you can chat about a big PDF without blowing the context window. Small docs are still inlined.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -90,7 +91,13 @@ cp config.template.json config.json
 | `image_generation.default_size` | Initial image size in the UI | `1024x1024` |
 | `image_generation.timeout_seconds` | Timeout for image generation requests | `300` |
 | `documents.max_file_size_mb` | Maximum upload size for attached files | `25` |
-| `documents.max_text_chars` | Extracted text is truncated beyond this length | `20000` |
+| `documents.max_text_chars` | Inlined (non-RAG) text is truncated beyond this length | `20000` |
+| `rag.enabled` | Retrieve large documents by relevance instead of inlining them | `true` |
+| `rag.embedding_model` | LM Studio embedding model used to index/search documents | `text-embedding-nomic-embed-text-v1.5` |
+| `rag.min_chars_for_rag` | Documents at least this long are indexed for retrieval | `8000` |
+| `rag.chunk_chars` | Target size of each retrieved chunk | `1200` |
+| `rag.chunk_overlap` | Overlap between consecutive chunks | `200` |
+| `rag.top_k` | Number of chunks injected into the prompt per question | `5` |
 | `tls.enabled` | Serve the app over HTTPS | `false` |
 | `tls.cert_file` | Path to a PEM certificate (`null` = auto-generate self-signed) | `null` |
 | `tls.key_file` | Path to the matching PEM private key | `null` |
@@ -132,6 +139,10 @@ Conversations are persisted server-side in a SQLite database under `data/` (giti
 - The topbar 🗑 starts a fresh chat without deleting anything.
 
 > The conversation endpoints are unauthenticated, like the rest of the app. On a trusted home LAN this is usually fine; if your network is shared, bind to `127.0.0.1` (set `host` in `config.json`) or put LocalMind behind an authenticating reverse proxy. Stored conversations include uploaded document text and pasted images.
+
+### Document retrieval (RAG)
+
+Small attached documents are inlined into the prompt as before. Documents at least `rag.min_chars_for_rag` characters long are instead **indexed for retrieval**: on upload they are chunked and embedded with a local LM Studio embedding model (`text-embedding-nomic-embed-text-v1.5` by default, loaded on demand), and the attachment chip shows “🔍 searchable”. For each question, only the most relevant chunks (`rag.top_k`) are embedded-matched and injected — so you can chat about a long PDF without it consuming the whole context window or being truncated. Follow-up questions keep using the same documents for the rest of the session. If the embedding model is unavailable, the upload falls back to inlining the (truncated) text, and retrieval misses degrade to answering without the document rather than erroring.
 
 ### Attaching files and images
 
@@ -238,8 +249,8 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | `GET` | `/` | Chat UI |
 | `GET` | `/api/config` | UI defaults (generation parameters, model management defaults) |
 | `GET` | `/api/models` | Loaded LLM instances (chat model dropdown source) |
-| `POST` | `/api/chat` | Streaming chat completion (SSE; supports multimodal content and `reasoning_effort`) |
-| `POST` | `/api/upload` | Extract text from a PDF/text/code file (multipart form) |
+| `POST` | `/api/chat` | Streaming chat completion (SSE; supports multimodal content, `reasoning_effort`, and `doc_ids` for RAG) |
+| `POST` | `/api/upload` | Extract/index a PDF/text/code file (multipart form); large docs return a `doc_id` for retrieval |
 | `GET` | `/api/conversations` | List saved conversations (newest first) |
 | `POST` | `/api/conversations` | Create an empty conversation |
 | `GET` | `/api/conversations/{id}` | Full message history of a conversation |

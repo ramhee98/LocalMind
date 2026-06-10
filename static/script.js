@@ -59,6 +59,8 @@
   let attachmentCounter = 0;
   /** Server-side conversation id; created lazily on the first exchange. */
   let currentConversationId = null;
+  /** RAG document ids attached this session, retrieved on each chat turn. */
+  let docIds = new Set();
   /** Model keys / instance ids with an in-flight load or unload request. */
   const busyModels = new Set();
 
@@ -448,9 +450,12 @@
       } else if (doc.kind === "image") {
         meta.textContent = "image";
       } else {
-        meta.textContent = (doc.pages
+        const base = doc.pages
           ? `${doc.pages} page${doc.pages === 1 ? "" : "s"}`
-          : `${doc.chars} chars`) + (doc.truncated ? " · truncated" : "");
+          : `${doc.chars} chars`;
+        meta.textContent = doc.rag
+          ? `${base} · 🔍 searchable`
+          : base + (doc.truncated ? " · truncated" : "");
       }
       chip.appendChild(meta);
 
@@ -701,6 +706,7 @@
     if (isStreaming) return;
     messages = [];
     attachments = [];
+    docIds = new Set();
     currentConversationId = null;
     renderAttachments();
     clearChatWindow();
@@ -898,6 +904,15 @@
       messages = Array.isArray(data.messages) ? data.messages : [];
       currentConversationId = id;
       attachments = [];
+      // Rehydrate RAG doc ids from saved metadata. After a server restart the
+      // in-memory index is gone; retrieval then returns nothing and the model
+      // simply answers without the document context (no error).
+      docIds = new Set();
+      for (const message of messages) {
+        for (const meta of (message.attachments_meta || [])) {
+          if (meta.doc_id) docIds.add(meta.doc_id);
+        }
+      }
       renderAttachments();
       renderConversationHistory();
       highlightActiveConversation();
@@ -985,9 +1000,13 @@
       }
       bubble.prepend(tags);
     }
-    // Extracted document text is sent to the LLM but only shown as a tag;
+    // Large docs are retrieved by doc_id (RAG); small docs are inlined as text.
     // images become OpenAI image_url content parts for vision models.
-    const docBlocks = docs
+    const ragDocs = docs.filter((doc) => doc.rag && doc.doc_id);
+    const inlineDocs = docs.filter((doc) => !doc.rag);
+    for (const doc of ragDocs) docIds.add(doc.doc_id);
+
+    const docBlocks = inlineDocs
       .map((doc) => `[Attached document: ${doc.name}]\n${doc.text}`)
       .join("\n\n");
     const fullText = docBlocks ? `${docBlocks}\n\n${content}` : content;
@@ -1007,7 +1026,10 @@
       display: content,
       attachments_meta: [
         ...images.map((image) => ({ kind: "image", name: image.name, dataUrl: image.dataUrl })),
-        ...docs.map((doc) => ({ kind: "document", name: doc.name, pages: doc.pages })),
+        ...docs.map((doc) => ({
+          kind: "document", name: doc.name, pages: doc.pages,
+          ...(doc.rag && doc.doc_id ? { doc_id: doc.doc_id } : {}),
+        })),
       ],
     });
     attachments = [];
@@ -1029,6 +1051,7 @@
       temperature: Number(temperatureInput.value),
       max_tokens: Math.max(1, Math.floor(Number(maxTokensInput.value) || 1024)),
       ...(reasoningEffortValue() ? { reasoning_effort: reasoningEffortValue() } : {}),
+      ...(docIds.size ? { doc_ids: [...docIds] } : {}),
     };
 
     // Lazily built structure inside the assistant bubble: an optional

@@ -26,6 +26,15 @@
     "max_file_size_mb": 25,
     "max_text_chars": 20000
   },
+  "rag": {
+    "enabled": true,
+    "embedding_model": "text-embedding-nomic-embed-text-v1.5",
+    "min_chars_for_rag": 8000,
+    "chunk_chars": 1200,
+    "chunk_overlap": 200,
+    "top_k": 5,
+    "embedding_ttl_seconds": 600
+  },
   "tls": {
     "enabled": false,
     "cert_file": null,

@@ -32,6 +32,7 @@ import copy
 import io
 import json
 import logging
+import math
 import os
 import sqlite3
 import uuid
@@ -88,6 +89,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "documents": {
         "max_file_size_mb": 25,
         "max_text_chars": 20000,
+    },
+    "rag": {
+        "enabled": True,
+        "embedding_model": "text-embedding-nomic-embed-text-v1.5",
+        # Documents longer than this (chars) are retrieved instead of inlined.
+        "min_chars_for_rag": 8000,
+        "chunk_chars": 1200,
+        "chunk_overlap": 200,
+        "top_k": 5,
+        "embedding_ttl_seconds": 600,
     },
     "tls": {
         "enabled": False,
@@ -178,6 +189,9 @@ class ChatRequest(BaseModel):
     # LM Studio reasoning control; None leaves the model's default untouched.
     reasoning_effort: Optional[str] = Field(
         default=None, pattern="^(none|minimal|low|medium|high|xhigh)$")
+    # RAG document ids; relevant chunks are retrieved and prepended to the
+    # last user turn instead of inlining whole documents.
+    doc_ids: Optional[list[str]] = Field(default=None)
 
 
 class LoadModelRequest(BaseModel):
@@ -457,13 +471,119 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
                 len(text), filename,
                 f" ({pages} pages)" if pages else "",
                 ", truncated" if truncated else "")
+
+    rag_config = CONFIG["rag"]
+    if rag_config["enabled"] and len(text) >= rag_config["min_chars_for_rag"]:
+        indexed = index_document(filename, text, pages)
+        if indexed is not None:
+            return JSONResponse(content=indexed)
+        # Embedding failed — fall back to inlining the (truncated) text.
+        logger.warning("RAG indexing failed for %s; falling back to inline text.", filename)
+
     return JSONResponse(content={
         "filename": filename,
         "pages": pages,
         "chars": len(text),
         "truncated": truncated,
         "text": text,
+        "rag": False,
     })
+
+
+# ---------- Retrieval-augmented generation over uploads ----------
+
+# In-memory chunk store, keyed by doc_id. Cleared on restart, which is fine:
+# the frontend re-uploads documents per session and degrades gracefully on miss.
+DOC_STORE: dict[str, dict[str, Any]] = {}
+
+
+def chunk_text(text: str, size: int, overlap: int) -> list[str]:
+    """Split text into overlapping chunks, preferring paragraph boundaries."""
+    chunks: list[str] = []
+    start = 0
+    length = len(text)
+    step = max(1, size - overlap)
+    while start < length:
+        end = min(start + size, length)
+        # Prefer to break on a paragraph/newline near the window edge.
+        if end < length:
+            window = text.rfind("\n", start + step, end)
+            if window != -1:
+                end = window
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end <= start:
+            break
+        start = end if end > start + step else start + step
+    return chunks
+
+
+def embed_texts(inputs: list[str]) -> Optional[list[list[float]]]:
+    """Embed inputs via LM Studio; returns None if the embedding API fails."""
+    try:
+        response = client.embeddings.create(
+            model=CONFIG["rag"]["embedding_model"], input=inputs)
+    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+        logger.warning("Embedding request failed: %s", getattr(exc, "message", exc))
+        return None
+    return [item.embedding for item in response.data]
+
+
+def index_document(filename: str, text: str, pages: Optional[int]) -> Optional[dict[str, Any]]:
+    """Chunk + embed a document, store it, and return upload metadata (or None)."""
+    config = CONFIG["rag"]
+    chunks = chunk_text(text, config["chunk_chars"], config["chunk_overlap"])
+    if not chunks:
+        return None
+    embeddings = embed_texts([f"search_document: {chunk}" for chunk in chunks])
+    if embeddings is None:
+        return None
+    doc_id = uuid.uuid4().hex
+    DOC_STORE[doc_id] = {"filename": filename, "chunks": chunks, "embeddings": embeddings}
+    logger.info("Indexed %s for RAG: %s chunks, doc_id=%s", filename, len(chunks), doc_id)
+    return {
+        "filename": filename,
+        "pages": pages,
+        "chars": len(text),
+        "truncated": False,
+        "rag": True,
+        "doc_id": doc_id,
+        "chunks": len(chunks),
+    }
+
+
+def _dot(a: list[float], b: list[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def retrieve_context(doc_ids: list[str], query: str) -> str:
+    """Return the top-k most relevant chunks across the given documents."""
+    pool: list[tuple[str, str, list[float]]] = []
+    for doc_id in doc_ids:
+        doc = DOC_STORE.get(doc_id)
+        if not doc:
+            continue
+        for chunk, embedding in zip(doc["chunks"], doc["embeddings"]):
+            pool.append((doc["filename"], chunk, embedding))
+    if not pool:
+        return ""
+    query_embedding = embed_texts([f"search_query: {query}"])
+    if query_embedding is None:
+        # Embedding the query failed: fall back to the first few chunks so the
+        # model still sees something relevant rather than nothing.
+        ranked = pool[: CONFIG["rag"]["top_k"]]
+    else:
+        q = query_embedding[0]
+        qnorm = math.sqrt(_dot(q, q)) or 1.0
+        scored = sorted(
+            pool,
+            key=lambda item: _dot(q, item[2]) / ((math.sqrt(_dot(item[2], item[2])) or 1.0) * qnorm),
+            reverse=True,
+        )
+        ranked = scored[: CONFIG["rag"]["top_k"]]
+    blocks = [f"[From {filename}]\n{chunk}" for filename, chunk, _ in ranked]
+    return "\n\n".join(blocks)
 
 
 # ---------- Image generation ----------
@@ -743,6 +863,40 @@ def unload_all_models() -> JSONResponse:
     return JSONResponse(content={"unloaded": unloaded, "errors": errors})
 
 
+def last_user_query(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        return str(part.get("text") or "")
+    return ""
+
+
+def apply_rag(messages: list[dict[str, Any]], doc_ids: list[str]) -> list[dict[str, Any]]:
+    """Prepend retrieved chunks to the final user turn for the given documents."""
+    query = last_user_query(messages)
+    context = retrieve_context(doc_ids, query) if query else ""
+    if not context:
+        return messages
+    augmented = [dict(message) for message in messages]
+    for message in reversed(augmented):
+        if message.get("role") != "user":
+            continue
+        preamble = ("Use the following excerpts from the user's uploaded "
+                    "documents to answer.\n\n" + context + "\n\n")
+        content = message["content"]
+        if isinstance(content, str):
+            message["content"] = preamble + content
+        elif isinstance(content, list):
+            message["content"] = [{"type": "text", "text": preamble}, *content]
+        break
+    return augmented
+
+
 def stream_completion(request: ChatRequest) -> Iterator[str]:
     """Yield Server-Sent Events with incremental completion tokens.
 
@@ -750,12 +904,15 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
     is already committed once streaming has started.
     """
     try:
+        outgoing = [message.model_dump() for message in request.messages]
+        if request.doc_ids:
+            outgoing = apply_rag(outgoing, request.doc_ids)
         extra_body: dict[str, Any] = {}
         if request.reasoning_effort:
             extra_body["reasoning_effort"] = request.reasoning_effort
         stream = client.chat.completions.create(
             model=request.model,
-            messages=[message.model_dump() for message in request.messages],
+            messages=outgoing,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             stream=True,
