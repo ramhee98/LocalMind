@@ -15,6 +15,9 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
   - **unload all** — free all memory with one click.
 - **Image generation (capability-detected)** — a 🎨 mode in the composer that generates images from text prompts via an OpenAI-compatible `/images/generations` endpoint. The UI detects automatically whether the connected server supports it; generated images render in the chat with click-to-zoom and a download link, and the image size is adjustable in settings.
 - **LLM prompt enhancement** — optionally let the selected chat model (e.g. Gemma in LM Studio) rewrite your short idea into a rich, detailed image prompt before generation; the enhanced prompt is shown under the image. If enhancement fails, the original prompt is used and you are notified.
+- **File attachments (📎 / drag & drop)** — attach PDFs, plain-text, and code files; their text is extracted server-side and injected into the chat context so you can ask questions about them. Limits are configurable, with clear errors for password-protected or scanned PDFs.
+- **Image attachments & pasted screenshots** — attach images via the picker, drag & drop, or simply paste a screenshot (Cmd+V); they are sent to vision-capable models (like Gemma) as multimodal input.
+- **Thinking control** — a settings option to turn model reasoning off/low/high per conversation; when a model thinks, the thought stream renders live in a collapsible 💭 block that folds away once the answer starts.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -85,6 +88,8 @@ cp config.template.json config.json
 | `image_generation.model` | Model name sent to the image API (`null` = let the server choose) | `null` |
 | `image_generation.default_size` | Initial image size in the UI | `1024x1024` |
 | `image_generation.timeout_seconds` | Timeout for image generation requests | `300` |
+| `documents.max_file_size_mb` | Maximum upload size for attached files | `25` |
+| `documents.max_text_chars` | Extracted text is truncated beyond this length | `20000` |
 
 `config.json` is gitignored, so your local settings never end up in version control. If it is missing, the app falls back to `config.template.json`, and finally to built-in defaults.
 
@@ -110,6 +115,21 @@ Then open <http://localhost:8000> in your browser.
 4. Watch the response stream in token-by-token. Use 🗑 to start a fresh conversation.
 
 If LM Studio is not running, a banner explains the problem and offers a **Retry** button.
+
+### Attaching files and images
+
+Use the 📎 button, drag & drop anywhere onto the page, or paste directly from the clipboard:
+
+- **Documents** (PDF, `.txt`, `.md`, `.csv`, `.json`, and common code files): the text is extracted on the server (PDFs via `pypdf`, with page markers) and prepended invisibly to your next message — the chat shows only a small 📄 tag, but the model receives the full text and can answer follow-up questions about it. Long documents are truncated to `documents.max_text_chars`. Scanned (image-only) and password-protected PDFs are rejected with a clear message; OCR is not supported.
+- **Images / screenshots**: attached images (or a pasted screenshot, Cmd+V) are sent as multimodal `image_url` content parts — this requires a vision-capable model (the Gemma models report `vision: true`). Thumbnails appear in the composer and in your message bubble.
+
+Attachments ride along with the *next* message you send and can be removed (✕) before sending.
+
+### Thinking (reasoning) control
+
+The ⚙ settings panel has a **Thinking** option mapped to LM Studio's `reasoning_effort` (`none` … `xhigh`); *Model default* leaves the model's own setting untouched. While a reasoning model thinks, the thoughts stream into a collapsible 💭 block above the answer, which folds closed when the actual answer begins. Thoughts are display-only — they are not sent back as context in later turns.
+
+> Tip: reasoning consumes your `max_tokens` budget. If answers come back empty with thinking enabled, raise **Max tokens** in settings.
 
 ### Managing models
 
@@ -179,7 +199,8 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | `GET` | `/` | Chat UI |
 | `GET` | `/api/config` | UI defaults (generation parameters, model management defaults) |
 | `GET` | `/api/models` | Loaded LLM instances (chat model dropdown source) |
-| `POST` | `/api/chat` | Streaming chat completion (Server-Sent Events) |
+| `POST` | `/api/chat` | Streaming chat completion (SSE; supports multimodal content and `reasoning_effort`) |
+| `POST` | `/api/upload` | Extract text from a PDF/text/code file (multipart form) |
 | `GET` | `/api/models/manage` | All downloaded models with load state and details |
 | `POST` | `/api/models/load` | Load a model: `{"model", "ttl_seconds"?, "context_length"?}` |
 | `POST` | `/api/models/unload` | Unload one instance: `{"instance_id"}` |
