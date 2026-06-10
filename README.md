@@ -4,10 +4,16 @@ A lightweight, self-hosted chat interface for a local [LM Studio](https://lmstud
 
 LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It talks to LM Studio's OpenAI-compatible API and gives you:
 
-- **Dynamic model selection** — the dropdown is populated from LM Studio's `/v1/models` endpoint at load time.
+- **Dynamic model selection** — the dropdown is populated with the models currently loaded in LM Studio.
 - **Real-time streaming** — responses render token-by-token via Server-Sent Events.
 - **Parameter controls** — adjust `temperature` and `max_tokens` from a settings panel before sending.
-- **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded.
+- **Model management** — load and unload models straight from the UI (📦 panel), with:
+  - **idle TTL (auto-unload)** — automatically unload a model after it has been idle for a configurable number of seconds,
+  - **context length override** — load a model with a custom context window,
+  - **live status** — loaded/not-loaded badges, parameter count, quantization, on-disk size, max context, and an estimate of memory in use, auto-refreshed while the panel is open,
+  - **multiple instances** — load a model more than once and unload each instance individually,
+  - **unload all** — free all memory with one click.
+- **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
 ## Directory Structure
@@ -68,6 +74,11 @@ cp config.template.json config.json
 | `defaults.temperature` | Initial temperature in the UI | `0.7` |
 | `defaults.max_tokens` | Initial max tokens in the UI | `1024` |
 | `defaults.system_prompt` | System prompt prepended to every conversation | `You are a helpful assistant.` |
+| `model_management.default_ttl_seconds` | Default idle TTL applied when loading a model from the UI | `600` |
+| `model_management.auto_unload_by_default` | Whether the "auto-unload after idle" checkbox starts enabled | `true` |
+| `model_management.default_context_length` | Default context length for loads (`null` = model default) | `null` |
+| `model_management.load_timeout_seconds` | How long to wait for a model load to complete | `600` |
+| `model_management.status_refresh_seconds` | Auto-refresh interval of the model panel while open | `10` |
 
 `config.json` is gitignored, so your local settings never end up in version control. If it is missing, the app falls back to `config.template.json`, and finally to built-in defaults.
 
@@ -93,6 +104,21 @@ Then open <http://localhost:8000> in your browser.
 4. Watch the response stream in token-by-token. Use 🗑 to start a fresh conversation.
 
 If LM Studio is not running, a banner explains the problem and offers a **Retry** button.
+
+### Managing models
+
+Open the 📦 panel to see every model downloaded in LM Studio with its load state and details.
+
+- **Load** a model with the options set at the top of the panel:
+  - *Auto-unload after idle* + *TTL (seconds)* — the model is automatically unloaded by LM Studio once it has been idle for that long. Uncheck to keep it loaded indefinitely.
+  - *Context length* — leave blank for the model's default, or set a custom context window.
+- **Unload** any loaded instance individually, or use **Unload all** to free all memory at once.
+- **Load another** creates an additional instance of an already-loaded model (e.g. with a different context length).
+- The panel auto-refreshes while open, so changes made in LM Studio itself (or TTL expirations) show up automatically.
+
+The chat model dropdown always reflects the currently loaded LLM instances and refreshes after every load/unload.
+
+> Model management uses LM Studio's native REST API (`/api/v1/models`), which requires a recent LM Studio version. Chat keeps working through the OpenAI-compatible API even if the native API is unavailable.
 
 ## Deployment Notes
 
@@ -123,9 +149,13 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/` | Chat UI |
-| `GET` | `/api/config` | UI defaults (temperature, max tokens, system prompt) |
-| `GET` | `/api/models` | Models currently available in LM Studio |
+| `GET` | `/api/config` | UI defaults (generation parameters, model management defaults) |
+| `GET` | `/api/models` | Loaded LLM instances (chat model dropdown source) |
 | `POST` | `/api/chat` | Streaming chat completion (Server-Sent Events) |
+| `GET` | `/api/models/manage` | All downloaded models with load state and details |
+| `POST` | `/api/models/load` | Load a model: `{"model", "ttl_seconds"?, "context_length"?}` |
+| `POST` | `/api/models/unload` | Unload one instance: `{"instance_id"}` |
+| `POST` | `/api/models/unload-all` | Unload every loaded instance |
 
 ## License
 
