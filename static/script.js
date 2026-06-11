@@ -849,6 +849,17 @@
     return bubble;
   }
 
+  // True when the view is at (or within a small slack of) the bottom. Lets us
+  // follow streaming output without yanking the user back down if they scrolled
+  // up to read earlier content.
+  function isPinnedToBottom() {
+    const slack = 80;
+    return (
+      chatWindow.scrollHeight - chatWindow.scrollTop - chatWindow.clientHeight <=
+      slack
+    );
+  }
+
   function updateSendState() {
     // While a chat reply streams, the button becomes an always-enabled Stop.
     if (isStreaming && chatAbortController) {
@@ -1998,16 +2009,18 @@
 
           const parsed = JSON.parse(data);
           if (parsed.error) throw new Error(parsed.error);
+          // Capture pin state before mutating, so growth doesn't unpin us.
+          const pinned = isPinnedToBottom();
           if (parsed.reasoning) {
             appendReasoning(parsed.reasoning);
-            chatWindow.scrollTop = chatWindow.scrollHeight;
+            if (pinned) chatWindow.scrollTop = chatWindow.scrollHeight;
           }
           if (parsed.content) {
             if (!assistantContent) finishThinking();
             ensureContentSpan();
             assistantContent += parsed.content;
             renderMarkdown(contentSpan, assistantContent, { withCopyButtons: false });
-            chatWindow.scrollTop = chatWindow.scrollHeight;
+            if (pinned) chatWindow.scrollTop = chatWindow.scrollHeight;
           }
         }
       }
