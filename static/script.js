@@ -940,7 +940,7 @@
 
   function renderConversationHistory() {
     clearChatWindow();
-    for (const message of messages) {
+    messages.forEach((message, index) => {
       if (message.role === "user") {
         const bubble = appendMessage("user", message.display ?? extractMessageText(message.content));
         const meta = Array.isArray(message.attachments_meta) ? message.attachments_meta : [];
@@ -964,11 +964,143 @@
           }
           bubble.prepend(tags);
         }
+        attachMessageActions(bubble, "user", index);
       } else if (message.role === "assistant") {
-        appendMessage("assistant", extractMessageText(message.content));
+        const bubble = appendMessage("assistant", extractMessageText(message.content));
+        attachMessageActions(bubble, "assistant", index);
       }
-    }
+    });
     chatWindow.scrollTop = chatWindow.scrollHeight;
+  }
+
+  // ---------- Edit & regenerate ----------
+
+  function attachMessageActions(bubble, role, index) {
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "message-action";
+    if (role === "user") {
+      action.textContent = "✏️ Edit";
+      action.title = "Edit this message and regenerate from here";
+      action.addEventListener("click", () => beginEditMessage(bubble, index));
+    } else {
+      action.textContent = "↻ Regenerate";
+      action.title = "Generate this response again";
+      action.addEventListener("click", () => regenerateFrom(index));
+    }
+    actions.appendChild(action);
+    bubble.appendChild(actions);
+  }
+
+  /**
+   * Replace the user-visible text of a message, preserving any inlined
+   * document blocks (string content) and image parts (multimodal content)
+   * around it.
+   */
+  function replaceMessageText(message, newText) {
+    const oldText = message.display ?? extractMessageText(message.content);
+    const swap = (text) =>
+      oldText && text.endsWith(oldText)
+        ? text.slice(0, text.length - oldText.length) + newText
+        : newText;
+    if (typeof message.content === "string") {
+      message.content = swap(message.content);
+    } else if (Array.isArray(message.content)) {
+      const part = message.content.find((entry) => entry?.type === "text");
+      if (part) part.text = swap(part.text || "");
+      else message.content.push({ type: "text", text: newText });
+    }
+    message.display = newText;
+  }
+
+  function beginEditMessage(bubble, index) {
+    if (isStreaming || bubble.classList.contains("editing") || !messages[index]) return;
+    const message = messages[index];
+    bubble.classList.add("editing");
+
+    const editor = document.createElement("textarea");
+    editor.className = "edit-area";
+    editor.value = message.display ?? extractMessageText(message.content);
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "small-button primary";
+    save.textContent = "Save & regenerate";
+    save.addEventListener("click", () => {
+      const newText = editor.value.trim();
+      if (newText) submitEdit(index, newText);
+    });
+
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "small-button";
+    cancel.textContent = "Cancel";
+    // Re-rendering restores the bubble (including attachment thumbnails).
+    cancel.addEventListener("click", () => renderConversationHistory());
+
+    const controls = document.createElement("div");
+    controls.className = "edit-controls";
+    controls.append(save, cancel);
+
+    bubble.textContent = "";
+    bubble.append(editor, controls);
+    const autosize = () => {
+      editor.style.height = "auto";
+      editor.style.height = `${Math.min(editor.scrollHeight, 240)}px`;
+    };
+    editor.addEventListener("input", autosize);
+    autosize();
+    editor.focus();
+    editor.setSelectionRange(editor.value.length, editor.value.length);
+    editor.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        save.click();
+      } else if (event.key === "Escape") {
+        renderConversationHistory();
+      }
+    });
+  }
+
+  async function submitEdit(index, newText) {
+    if (isStreaming || !messages[index]) return;
+    if (!modelSelect.value) {
+      toast("Select a model to regenerate the response.", "error", 6000);
+      return;
+    }
+    // Editing always drops this message's reply; warn only if more follows.
+    if (messages.length - index > 2 &&
+        !window.confirm("Editing this message will discard the rest of the conversation after it. Continue?")) {
+      return;
+    }
+    replaceMessageText(messages[index], newText);
+    messages = messages.slice(0, index + 1);
+    renderConversationHistory();
+    hideError();
+    isStreaming = true;
+    updateSendState();
+    persistConversation();
+    await streamAssistantTurn();
+  }
+
+  async function regenerateFrom(index) {
+    if (isStreaming || !messages[index]) return;
+    if (!modelSelect.value) {
+      toast("Select a model to regenerate the response.", "error", 6000);
+      return;
+    }
+    if (index < messages.length - 1 &&
+        !window.confirm("Regenerating this response will discard the rest of the conversation after it. Continue?")) {
+      return;
+    }
+    messages = messages.slice(0, index);
+    renderConversationHistory();
+    hideError();
+    isStreaming = true;
+    updateSendState();
+    await streamAssistantTurn();
   }
 
   async function openConversation(id) {
@@ -1110,11 +1242,21 @@
     });
     attachments = [];
     renderAttachments();
+    attachMessageActions(bubble, "user", messages.length - 1);
 
     // Persist the user turn before streaming so a reload/crash mid-generation
     // doesn't lose the prompt (local models can stream for minutes).
     persistConversation();
 
+    await streamAssistantTurn();
+  }
+
+  /**
+   * Stream one assistant reply for the current `messages` history into a new
+   * bubble. Expects `isStreaming` to already be true; appends the reply to
+   * the history and persists the conversation when done.
+   */
+  async function streamAssistantTurn() {
     const assistantBubble = appendMessage("assistant", "");
     assistantBubble.classList.add("pending");
     let assistantContent = "";
@@ -1222,10 +1364,12 @@
       finishThinking();
       // Only the final answer (not the thinking) goes back into the history.
       messages.push({ role: "assistant", content: assistantContent });
+      attachMessageActions(assistantBubble, "assistant", messages.length - 1);
     } catch (error) {
       if (assistantContent) {
         // Keep the partial answer in history so the conversation stays coherent.
         messages.push({ role: "assistant", content: assistantContent });
+        attachMessageActions(assistantBubble, "assistant", messages.length - 1);
       } else {
         assistantBubble.remove();
       }

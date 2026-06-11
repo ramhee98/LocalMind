@@ -620,6 +620,7 @@ input[type="number"] {
 }
 
 .message {
+  position: relative;
   max-width: 78%;
   padding: 12px 16px;
   border-radius: var(--radius);
@@ -655,6 +656,62 @@ input[type="number"] {
 }
 
 @keyframes blink { 50% { opacity: 0; } }
+
+/* ---------- Edit & regenerate ---------- */
+
+.message .message-actions {
+  position: absolute;
+  bottom: -12px;
+  display: none;
+  gap: 4px;
+  z-index: 5;
+}
+
+.message.user .message-actions { right: 8px; }
+.message.assistant .message-actions { left: 8px; }
+
+.message:hover .message-actions,
+.message-actions:focus-within { display: flex; }
+
+/* No hover on touch screens: keep the actions visible but subtle. */
+@media (hover: none) {
+  .message .message-actions { display: flex; opacity: 0.75; }
+}
+
+.message-action {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 8px;
+  font-size: 0.72rem;
+  padding: 2px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: var(--shadow);
+}
+
+.message-action:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.message.editing { width: 78%; }
+
+.message .edit-area {
+  width: 100%;
+  resize: none;
+  padding: 9px 11px;
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.message .edit-controls {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
 
 /* ---------- Image generation ---------- */
 
