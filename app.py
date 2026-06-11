@@ -41,6 +41,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -124,8 +125,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "searxng_base_url": None,
         # ddgs engine order ("auto" rotates randomly, which mixes in weak
         # engines — fuzzy Wikipedia title matches and the like). Must use
-        # names ddgs knows, or it silently falls back to "auto".
-        "backends": "duckduckgo, brave, bing",
+        # names ddgs knows, or it silently falls back to "auto". bing is
+        # deliberately absent: it returns fuzzy keyword matches that poison
+        # the context (e.g. beer-company pages for an "Asahi Linux" query).
+        "backends": "duckduckgo, mojeek, brave",
         "max_results": 5,
         "timeout_seconds": 15,
         # Distill the conversation into a search query with the chat model
@@ -139,6 +142,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "top_k": 6,
         # Extracted text per page is capped at this many characters.
         "max_page_chars": 20000,
+        # Research mode: the question is decomposed into sub-queries, each is
+        # searched and read, then the model reviews what was found and
+        # proposes follow-up queries for the gaps — repeated up to
+        # research_max_rounds times (the loop is code-bounded; the model only
+        # proposes queries). 1 round = plain fan-out without reflection.
+        "research_max_rounds": 2,
+        "research_queries_per_round": 3,
+        # How many ranked page excerpts the synthesis prompt receives. Mind
+        # the model's context window: ~12 excerpts ≈ 4k tokens.
+        "research_top_k": 12,
     },
     "tls": {
         "enabled": False,
@@ -232,9 +245,10 @@ class ChatRequest(BaseModel):
     # RAG document ids; relevant chunks are retrieved and prepended to the
     # last user turn instead of inlining whole documents.
     doc_ids: Optional[list[str]] = Field(default=None)
-    # When true, web search results for the user's question are prepended to
-    # the last user turn (same injection mechanism as RAG).
-    web_search: bool = Field(default=False)
+    # Web grounding mode: "search" injects results for one rewritten query;
+    # "research" runs the multi-round plan/search/reflect pipeline. Either
+    # way the findings are prepended to the last user turn like RAG.
+    web_search: Optional[str] = Field(default=None, pattern="^(search|research)$")
     # Idle TTL (seconds) for LM Studio to apply when this request JIT-loads the
     # model. None means "use the configured default"; 0 disables auto-unload.
     ttl_seconds: Optional[int] = Field(default=None, ge=0, le=86400 * 7)
@@ -1499,6 +1513,34 @@ SEARCH_QUERY_SYSTEM_PROMPT = (
 )
 
 
+def quick_completion(model: str, system: str, user: str, max_tokens: int = 300) -> Optional[str]:
+    """One short, non-reasoning helper completion; None on failure.
+
+    Used for the auxiliary LLM calls around web search (query rewriting,
+    research planning/reflection) — callers must fall back gracefully.
+    """
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=max_tokens,
+            # Reasoning models would otherwise spend the budget thinking.
+            extra_body={"reasoning_effort": "none"},
+        )
+    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+        logger.warning("Helper completion failed: %s", getattr(exc, "message", exc))
+        return None
+    text = (completion.choices[0].message.content or "").strip()
+    # Some reasoning models emit a <think>...</think> block before the answer.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1].strip()
+    return text or None
+
+
 def rewrite_search_query(model: str, messages: list[dict[str, Any]], fallback: str) -> str:
     """Distill the conversation's last question into a short search query.
 
@@ -1515,26 +1557,9 @@ def rewrite_search_query(model: str, messages: list[dict[str, Any]], fallback: s
             continue
         # Keep the tail: attachment text is prepended, the question comes last.
         lines.append(f"{message['role']}: {text[-800:]}")
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SEARCH_QUERY_SYSTEM_PROMPT},
-                {"role": "user", "content": "\n\n".join(lines)},
-            ],
-            temperature=0.0,
-            max_tokens=200,
-            # Reasoning models would otherwise spend the budget thinking.
-            extra_body={"reasoning_effort": "none"},
-        )
-    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
-        logger.warning("Search query rewrite failed: %s", getattr(exc, "message", exc))
-        return fallback
-    text = (completion.choices[0].message.content or "").strip()
-    # Some reasoning models emit a <think>...</think> block before the answer.
-    if "</think>" in text:
-        text = text.rsplit("</think>", 1)[-1].strip()
-    text = " ".join(text.split()).strip("\"'")
+    text = quick_completion(model, SEARCH_QUERY_SYSTEM_PROMPT, "\n\n".join(lines),
+                            max_tokens=200)
+    text = " ".join(text.split()).strip("\"'") if text else ""
     if not text or len(text) > 200:
         return fallback
     return text
@@ -1639,10 +1664,22 @@ def web_search_context(query: str) -> str:
             pool.append((item, chunk))
     if not pool:
         return snippets
+    top = rank_chunks_by_query(query, pool, CONFIG["web_search"]["top_k"])
+    if top is None:
+        return snippets
+    excerpts = "\n\n".join(
+        f"[{item['title']}]({item['url']})\n{chunk}" for item, chunk in top)
+    return snippets + "\n\nRelevant excerpts from the result pages:\n\n" + excerpts
+
+
+def rank_chunks_by_query(
+    query: str, pool: list[tuple[dict[str, str], str]], top_k: int
+) -> Optional[list[tuple[dict[str, str], str]]]:
+    """Embed-rank (result, chunk) pairs against the query; None if embeddings fail."""
     chunk_embeddings = embed_texts([f"search_document: {chunk}" for _, chunk in pool])
     query_embedding = embed_texts([f"search_query: {query}"]) if chunk_embeddings else None
     if not chunk_embeddings or not query_embedding:
-        return snippets
+        return None
     q = query_embedding[0]
     qnorm = math.sqrt(_dot(q, q)) or 1.0
     scored = sorted(
@@ -1650,10 +1687,7 @@ def web_search_context(query: str) -> str:
         key=lambda entry: _dot(q, entry[1]) / ((math.sqrt(_dot(entry[1], entry[1])) or 1.0) * qnorm),
         reverse=True,
     )
-    top = scored[: CONFIG["web_search"]["top_k"]]
-    excerpts = "\n\n".join(
-        f"[{item['title']}]({item['url']})\n{chunk}" for (item, chunk), _ in top)
-    return snippets + "\n\nRelevant excerpts from the result pages:\n\n" + excerpts
+    return [pair for pair, _ in scored[:top_k]]
 
 
 def apply_web_search(messages: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
@@ -1675,6 +1709,178 @@ def apply_web_search(messages: list[dict[str, Any]], query: str) -> list[dict[st
     return prepend_to_last_user_turn(messages, preamble)
 
 
+# ---------- Web research (multi-round search) ----------
+
+RESEARCH_PLAN_SYSTEM_PROMPT = (
+    "You are a research planner. Given a question, reply with the distinct web "
+    "search queries (each a few keywords) that together cover what is needed "
+    "to answer it thoroughly. One query per line — no numbering, no "
+    "explanations."
+)
+
+RESEARCH_REFLECT_SYSTEM_PROMPT = (
+    "You are reviewing the sources a web research pass has collected so far. "
+    "Decide what important information is still missing to answer the user's "
+    "question. Reply with new web search queries that would fill the gaps, "
+    "one per line (a few keywords each, no numbering, no explanations) — or "
+    "reply with the single word DONE if the sources already cover the question."
+)
+
+RESEARCH_FILTER_SYSTEM_PROMPT = (
+    "You are filtering web search results for relevance. Given a question and "
+    "a numbered list of results, reply with only the numbers of the results "
+    "that are actually about the question's topic, comma-separated "
+    "(for example: 1, 3, 4). Reply with the single word NONE if no result is "
+    "relevant."
+)
+
+# Backstop for the chunk pool across all rounds, so a misconfigured
+# rounds/results combination can't produce an enormous embedding request.
+RESEARCH_POOL_CAP = 400
+
+
+def parse_query_lines(text: str, limit: int) -> list[str]:
+    """Extract up to `limit` queries from LLM output, one per line.
+
+    Tolerates the numbering/bullets models add despite instructions.
+    """
+    queries: list[str] = []
+    for line in text.splitlines():
+        line = re.sub(r"^[\s\-*•]*(?:\d+[.)])?\s*", "", line).strip().strip("\"'")
+        if not line or line.upper() == "DONE" or len(line) > 200:
+            continue
+        if line.lower() not in (q.lower() for q in queries):
+            queries.append(line)
+    return queries[:limit]
+
+
+def plan_research_queries(model: str, query: str, limit: int) -> list[str]:
+    """Decompose the question into sub-queries; the raw question on failure."""
+    text = quick_completion(
+        model, RESEARCH_PLAN_SYSTEM_PROMPT,
+        f"Question: {query}\n\nReply with at most {limit} queries.")
+    return parse_query_lines(text or "", limit) or [query[:400]]
+
+
+def filter_relevant_results(
+    model: str, query: str, results: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    """Drop results that are off-topic for the question.
+
+    Search engines fuzzy-match keywords (an "Asahi Linux" query returns beer
+    company pages), and embeddings can't tell those apart — the shared brand
+    token dominates the similarity. A quick LLM call separates them reliably.
+    Returns the input unchanged when the call fails; an empty list when the
+    model judges nothing relevant.
+    """
+    if len(results) <= 1:
+        return results
+    candidates = results[:30]
+    listing = "\n".join(
+        f"{index}. {item['title']} — {item['snippet'][:120]}"
+        for index, item in enumerate(candidates, 1))
+    text = quick_completion(
+        model, RESEARCH_FILTER_SYSTEM_PROMPT,
+        f"Question: {query}\n\nResults:\n{listing}")
+    if not text:
+        return results
+    if text.strip().upper().startswith("NONE"):
+        return []
+    indices = {int(number) for number in re.findall(r"\d+", text)}
+    if not indices:
+        return results
+    kept = [item for index, item in enumerate(candidates, 1) if index in indices]
+    return kept or results
+
+
+def reflect_research_gaps(
+    model: str, query: str, results: list[dict[str, str]], limit: int
+) -> list[str]:
+    """Ask the model which follow-up queries would fill gaps; [] means stop."""
+    sources = "\n".join(
+        f"- {item['title']}: {item['snippet'][:150]}" for item in results[:25])
+    text = quick_completion(
+        model, RESEARCH_REFLECT_SYSTEM_PROMPT,
+        f"Question: {query}\n\nSources collected so far:\n{sources}\n\n"
+        f"Reply with at most {limit} queries, or DONE.")
+    if not text or text.strip().upper().startswith("DONE"):
+        return []
+    return parse_query_lines(text, limit)
+
+
+def research_context(model: str, query: str) -> Iterator[str]:
+    """Run the multi-round research pipeline, yielding progress statuses.
+
+    Returns (via the generator's StopIteration value) the assembled context
+    block, or "" when nothing usable was found. The loop is bounded by code —
+    the model only proposes queries, it never decides how long to run.
+    """
+    config = CONFIG["web_search"]
+    rag = CONFIG["rag"]
+    max_rounds = max(1, int(config["research_max_rounds"]))
+    per_round = max(1, int(config["research_queries_per_round"]))
+    seen_queries: set[str] = set()
+    seen_urls: set[str] = set()
+    results_found: list[dict[str, str]] = []
+    pool: list[tuple[dict[str, str], str]] = []
+    yield "🔬 Planning research…"
+    queries = plan_research_queries(model, query, per_round)
+    for round_no in range(1, max_rounds + 1):
+        queries = [q for q in queries if q.lower() not in seen_queries][:per_round]
+        if not queries:
+            break
+        round_results: list[dict[str, str]] = []
+        for sub_query in queries:
+            seen_queries.add(sub_query.lower())
+            yield f"🔬 Round {round_no}/{max_rounds}: searching “{sub_query}”…"
+            try:
+                found = run_web_search(sub_query[:400])
+            except WebSearchError as exc:
+                logger.warning("Research query %r failed: %s", sub_query, exc)
+                continue
+            new_results = [r for r in found if r["url"] and r["url"] not in seen_urls]
+            seen_urls.update(r["url"] for r in new_results)
+            round_results.extend(new_results)
+        # Filter before fetching so off-topic pages cost nothing and the
+        # reflection step reasons over clean sources.
+        if len(round_results) > 1:
+            yield f"🔬 Round {round_no}/{max_rounds}: checking relevance…"
+            kept = filter_relevant_results(model, query, round_results)
+            if len(kept) < len(round_results):
+                logger.info("Research relevance filter dropped %d of %d results",
+                            len(round_results) - len(kept), len(round_results))
+            round_results = kept
+        results_found.extend(round_results)
+        if config["fetch_pages"] and round_results and len(pool) < RESEARCH_POOL_CAP:
+            yield f"🔬 Round {round_no}/{max_rounds}: reading {len(round_results)} pages…"
+            texts = fetch_page_texts(round_results)
+            for item in round_results:
+                for chunk in chunk_text(texts.get(item["url"], ""),
+                                        rag["chunk_chars"], rag["chunk_overlap"]):
+                    pool.append((item, chunk))
+            if len(pool) >= RESEARCH_POOL_CAP:
+                logger.info("Research chunk pool capped at %d chunks", RESEARCH_POOL_CAP)
+        if round_no < max_rounds:
+            yield "🔬 Reviewing findings for gaps…"
+            queries = reflect_research_gaps(model, query, results_found, per_round)
+    if not results_found:
+        return ""
+    # The snippet list doubles as the source index for citations; cap it so a
+    # large rounds × results configuration can't flood the prompt.
+    snippets = "Search results:\n\n" + "\n\n".join(
+        f"[{index}] {item['title']}\n{item['url']}\n{item['snippet']}"
+        for index, item in enumerate(results_found[:15], 1))
+    if not pool:
+        return snippets
+    yield "🔬 Ranking findings…"
+    top = rank_chunks_by_query(query, pool[:RESEARCH_POOL_CAP], config["research_top_k"])
+    if top is None:
+        return snippets
+    excerpts = "\n\n".join(
+        f"[{item['title']}]({item['url']})\n{chunk}" for item, chunk in top)
+    return snippets + "\n\nRelevant excerpts from the result pages:\n\n" + excerpts
+
+
 def stream_completion(request: ChatRequest) -> Iterator[str]:
     """Yield Server-Sent Events with incremental completion tokens.
 
@@ -1687,8 +1893,9 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
         # Capture the user's question before RAG prepends document context to it.
         query = last_user_query(outgoing)
         web_config = CONFIG["web_search"]
+        mode = request.web_search if (web_config["enabled"] and query) else None
         search_query = None
-        if request.web_search and web_config["enabled"] and query:
+        if mode == "search":
             search_query = query
             if web_config["rewrite_query"]:
                 yield f"data: {json.dumps({'status': '🌐 Preparing web search…'})}\n\n"
@@ -1699,7 +1906,7 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                     logger.info("Search query rewritten: %r", search_query)
         if request.doc_ids:
             outgoing = apply_rag(outgoing, request.doc_ids)
-        if search_query:
+        if mode == "search":
             searching = ("🌐 Searching the web & reading the top results…"
                          if web_config["fetch_pages"] else "🌐 Searching the web…")
             yield f"data: {json.dumps({'status': searching})}\n\n"
@@ -1710,6 +1917,30 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                 # the model answer from its own knowledge.
                 logger.warning("Web search failed: %s", exc)
                 notice = f"Web search failed — {exc}. Answering without web results."
+                yield f"data: {json.dumps({'notice': notice})}\n\n"
+        elif mode == "research":
+            # Drain the research generator, forwarding its progress statuses;
+            # its return value is the assembled context block.
+            research = research_context(request.model, query)
+            research_block = ""
+            while True:
+                try:
+                    status = next(research)
+                except StopIteration as stop:
+                    research_block = stop.value or ""
+                    break
+                yield f"data: {json.dumps({'status': status})}\n\n"
+            if research_block:
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                preamble = (
+                    f"Research findings retrieved {today} (UTC) by a "
+                    "multi-query web search. Write a thorough, well-structured "
+                    "answer from them: use headings where helpful, cite "
+                    "sources inline as markdown links, and note anything the "
+                    "findings leave open.\n\n" + research_block + "\n\n")
+                outgoing = prepend_to_last_user_turn(outgoing, preamble)
+            else:
+                notice = "Web research found no usable sources. Answering without web results."
                 yield f"data: {json.dumps({'notice': notice})}\n\n"
         extra_body: dict[str, Any] = {}
         if request.reasoning_effort:

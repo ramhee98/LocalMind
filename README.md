@@ -26,7 +26,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Edit & regenerate** — hover any of your messages to ✏️ edit it (attachments are preserved) or any answer to ↻ regenerate it; the conversation is truncated at that point and re-streamed, with a confirmation if later messages would be discarded.
 - **Context-window meter** — a gauge in the composer estimates the prompt size (system prompt, history, attachments, retrieved RAG chunks, and your draft) against the loaded model's actual context window, turning yellow at 80% and red at 95%.
 - **Document retrieval (RAG)** — long uploads are chunked, embedded with a local embedding model, and queried by relevance per question (only the top matches enter the prompt) — so you can chat about a big PDF without blowing the context window. Small docs are still inlined.
-- **Web search (🌐 toggle)** — flip the composer toggle to ground answers in live web results: the chat model first distills your question (with conversation context, so follow-ups work) into a search query, the top result pages are downloaded and embed-ranked against it with the local embedding model, and the best excerpts are injected into the prompt with sources cited inline as links. Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
+- **Web search & research (🌐)** — a Web control in the composer grounds answers in live web results, in two modes. *Search*: the chat model distills your question (with conversation context, so follow-ups work) into a search query, the top result pages are downloaded and embed-ranked against it with the local embedding model, and the best excerpts are injected into the prompt with sources cited inline as links. *Research*: a bounded multi-round pipeline — the model plans sub-queries, results are LLM-filtered for relevance and their pages read, the model reviews the findings for gaps and searches again, and everything is synthesized into a structured, cited answer (slower, deeper). Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -152,25 +152,38 @@ Conversations are persisted server-side in a SQLite database under `data/` (giti
 
 Small attached documents are inlined into the prompt as before. Documents at least `rag.min_chars_for_rag` characters long are instead **indexed for retrieval**: on upload they are chunked and embedded with a local LM Studio embedding model (`text-embedding-nomic-embed-text-v1.5` by default, loaded on demand), and the attachment chip shows “🔍 searchable”. For each question, only the most relevant chunks (`rag.top_k`) are embedded-matched and injected — so you can chat about a long PDF without it consuming the whole context window or being truncated. Follow-up questions keep using the same documents for the rest of the session. If the embedding model is unavailable, the upload falls back to inlining the (truncated) text, and retrieval misses degrade to answering without the document rather than erroring.
 
-### Web search
+### Web search & research
 
-Turn on the **🌐 Web search** toggle in the composer to ground answers in live web results. Each search runs a small pipeline:
+Set the **🌐 Web** control in the composer to *Search* or *Research* to ground answers in live web results.
+
+**Search** runs a quick pipeline (~5–10s):
 
 1. **Query rewriting** — the selected chat model distills your message and the recent turns into a concise search query (one quick `reasoning_effort: none` call), so conversational phrasing and follow-ups like *"and what about the next one?"* still search well.
 2. **Search** — the query goes to the configured provider: DuckDuckGo via the [ddgs](https://pypi.org/project/ddgs/) package (default, no API key) or a self-hosted SearXNG instance.
 3. **Read & rank** — the top result pages are downloaded in parallel, stripped to text, chunked, and ranked against the query with the same local embedding model RAG uses; the result snippets plus the most relevant page excerpts are injected into the prompt, and the model is asked to cite sources as inline links.
 
-Status notes ("Preparing web search…", "Searching the web…") show in the reply bubble while this runs, and the toggle state is remembered across reloads.
+**Research** runs a deeper, multi-round pipeline (typically 1–3 minutes) for questions that deserve more than one query:
+
+1. **Plan** — the model decomposes your question into up to `research_queries_per_round` distinct sub-queries.
+2. **Search & filter** — each sub-query is searched; a quick LLM call then drops off-topic results (search engines fuzzy-match keywords — an "Asahi Linux" query happily returns beer-company pages — and that junk would otherwise poison the answer).
+3. **Read** — the pages behind the relevant results are downloaded and chunked.
+4. **Reflect** — the model reviews what was found and proposes follow-up queries for the gaps; steps 2–4 repeat up to `research_max_rounds` times. The loop is bounded by code — the model only proposes queries, it never decides how long to run.
+5. **Synthesize** — the best `research_top_k` excerpts (embed-ranked against your original question) are injected, and the model is asked to write a thorough, structured answer with inline citations.
+
+Live progress ("Round 1/2: searching …", "checking relevance…", "reading 14 pages…") shows in the reply bubble while either mode runs, and the control's state is remembered across reloads.
+
+> Tip: research answers are long — raise **Max tokens** in settings (4096+) so the synthesis isn't cut off. With `research_max_rounds: 1`, Research becomes a single fan-out pass without reflection (faster, still multi-query).
 
 Configured under `web_search` in `config.json`:
 
 - `provider` — `duckduckgo` (default, no API key or setup needed) or `searxng`.
 - `searxng_base_url` — your [SearXNG](https://docs.searxng.org/) instance, e.g. `http://localhost:8888`, if you prefer to keep search queries on infrastructure you control. The instance must allow the JSON output format (`formats: [html, json]` in its `settings.yml`).
-- `backends` — engine order for ddgs (default `duckduckgo, brave, bing`). Unknown names make ddgs fall back to its full random rotation, which includes weaker engines.
+- `backends` — engine order for ddgs (default `duckduckgo, mojeek, brave`). Unknown names make ddgs fall back to its full random rotation, which includes weaker engines; `bing` is left out deliberately because its fuzzy keyword matches poison the context.
 - `rewrite_query` — set `false` to search with the raw chat message instead of the LLM-rewritten query (faster, noticeably worse for conversational questions).
 - `fetch_pages` — set `false` to inject only the search snippets without downloading pages (faster, shallower answers). `top_k` controls how many ranked page excerpts are injected and `max_page_chars` how much text per page is considered.
-- `max_results` / `timeout_seconds` — how many search results to use and how long to wait.
-- `enabled: false` hides the toggle entirely.
+- `max_results` / `timeout_seconds` — how many search results to use per query and how long to wait.
+- `research_max_rounds` / `research_queries_per_round` / `research_top_k` — research depth: how many plan-search-reflect rounds to run, how many sub-queries each round may search, and how many ranked excerpts the synthesis prompt receives (~12 ≈ 4k tokens; mind the model's context window).
+- `enabled: false` hides the Web control entirely.
 
 If a search fails (offline, rate-limited, misconfigured), a toast explains why and the model answers from its own knowledge instead of erroring. The same applies piecewise further down the pipeline: if the query rewrite fails the raw question is searched, and if page downloads or the embedding model are unavailable the snippets alone are injected.
 

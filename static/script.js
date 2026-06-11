@@ -49,7 +49,7 @@
   const composerControls = document.getElementById("composer-controls");
   const thinkingModeSelect = document.getElementById("thinking-mode");
   const effortLevelSelect = document.getElementById("effort-level");
-  const webSearchToggle = document.getElementById("web-search-toggle");
+  const webModeSelect = document.getElementById("web-mode");
   const sidebar = document.getElementById("sidebar");
   const sidebarToggle = document.getElementById("sidebar-toggle");
   const sidebarBackdrop = document.getElementById("sidebar-backdrop");
@@ -92,10 +92,8 @@
   let contextWindows = {};
   /** RAG retrieval parameters from the server, for token estimation. */
   let ragEstimate = { top_k: 0, chunk_chars: 0 };
-  /** Whether to augment the next message with web search results. */
-  let webSearchEnabled = false;
-  /** localStorage key remembering the web search toggle across reloads. */
-  const WEB_SEARCH_KEY = "localmind.webSearch";
+  /** localStorage key remembering the web mode (off/search/research). */
+  const WEB_MODE_KEY = "localmind.webMode";
 
   // ---------- Error banner ----------
 
@@ -159,8 +157,8 @@
         ragEstimate = { top_k: data.rag.top_k, chunk_chars: data.rag.chunk_chars || 0 };
       }
       if (data.web_search && !data.web_search.enabled) {
-        webSearchToggle.classList.add("hidden");
-        if (webSearchEnabled) setWebSearch(false);
+        webModeSelect.parentElement.classList.add("hidden");
+        webModeSelect.value = "";
       }
       const defaultSize = data.image_generation?.default_size;
       if (defaultSize) {
@@ -1073,23 +1071,25 @@
     effortLevelSelect.disabled = thinkingModeSelect.value !== "on";
   });
 
-  // ---------- Web search toggle ----------
+  // ---------- Web search / research mode ----------
 
-  function setWebSearch(on) {
-    webSearchEnabled = on;
-    webSearchToggle.classList.toggle("active", on);
-    webSearchToggle.setAttribute("aria-pressed", String(on));
+  webModeSelect.addEventListener("change", () => {
     try {
-      if (on) localStorage.setItem(WEB_SEARCH_KEY, "1");
-      else localStorage.removeItem(WEB_SEARCH_KEY);
+      if (webModeSelect.value) localStorage.setItem(WEB_MODE_KEY, webModeSelect.value);
+      else localStorage.removeItem(WEB_MODE_KEY);
     } catch { /* localStorage may be unavailable (private mode); ignore. */ }
-  }
+  });
 
-  webSearchToggle.addEventListener("click", () => setWebSearch(!webSearchEnabled));
-
-  // Restore the last toggle state; the server config may still hide it.
+  // Restore the last mode; the server config may still hide the control.
   try {
-    if (localStorage.getItem(WEB_SEARCH_KEY) === "1") setWebSearch(true);
+    let stored = localStorage.getItem(WEB_MODE_KEY);
+    // Migrate the boolean key of the earlier toggle-button incarnation.
+    if (stored === null && localStorage.getItem("localmind.webSearch") === "1") {
+      stored = "search";
+      localStorage.removeItem("localmind.webSearch");
+      localStorage.setItem(WEB_MODE_KEY, stored);
+    }
+    if (stored === "search" || stored === "research") webModeSelect.value = stored;
   } catch { /* ignore */ }
 
   function setImageMode(on) {
@@ -1958,7 +1958,7 @@
       max_tokens: Math.max(1, Math.floor(Number(maxTokensInput.value) || 1024)),
       ...(reasoningEffortValue() ? { reasoning_effort: reasoningEffortValue() } : {}),
       ...(docIds.size ? { doc_ids: [...docIds] } : {}),
-      ...(webSearchEnabled ? { web_search: true } : {}),
+      ...(webModeSelect.value ? { web_search: webModeSelect.value } : {}),
       // Drive LM Studio's idle auto-unload from the load panel's TTL control.
       // It only takes effect when this message JIT-loads the model; an
       // already-loaded instance keeps the TTL it was loaded with. Unchecked
