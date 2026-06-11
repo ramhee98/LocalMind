@@ -849,6 +849,18 @@ def fetch_native_models() -> list[dict[str, Any]]:
     return response.json().get("models", [])
 
 
+def model_max_context_length(model_key: str) -> Optional[int]:
+    """The model's own maximum context length, or None if it can't be determined."""
+    try:
+        for model in fetch_native_models():
+            if model.get("key") == model_key:
+                max_context = model.get("max_context_length")
+                return int(max_context) if max_context else None
+    except (httpx.HTTPError, ValueError, TypeError):
+        logger.warning("Could not resolve max context length for %s", model_key)
+    return None
+
+
 def native_error_message(response: httpx.Response) -> str:
     """Extract a human-readable message from a native API error response."""
     try:
@@ -931,8 +943,18 @@ def load_model(request: LoadModelRequest) -> JSONResponse:
     payload: dict[str, Any] = {"model": request.model}
     if request.ttl_seconds is not None:
         payload["ttl_seconds"] = request.ttl_seconds
-    if request.context_length is not None:
-        payload["context_length"] = request.context_length
+
+    # Resolve the context length to use. An explicit request wins; otherwise fall
+    # back to the configured default, and finally to the model's own maximum.
+    # Without this, LM Studio loads every model at a hardcoded 8192 rather than
+    # the model's real default context window.
+    context_length = request.context_length
+    if context_length is None:
+        context_length = CONFIG["model_management"].get("default_context_length")
+    if context_length is None:
+        context_length = model_max_context_length(request.model)
+    if context_length is not None:
+        payload["context_length"] = context_length
     try:
         response = native_client.post(
             "/api/v1/models/load",
@@ -946,7 +968,7 @@ def load_model(request: LoadModelRequest) -> JSONResponse:
         logger.error("Failed to load %s: %s", request.model, response.text)
         return JSONResponse(status_code=502, content={"error": native_error_message(response)})
     logger.info("Loaded model %s (ttl=%s, context_length=%s)",
-                request.model, request.ttl_seconds, request.context_length)
+                request.model, request.ttl_seconds, context_length)
     return JSONResponse(content=response.json())
 
 
