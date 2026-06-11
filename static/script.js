@@ -435,6 +435,8 @@
   }
 
   function loadOptions() {
+    // TTL is applied by the backend via the `lms` CLI (the REST load endpoint
+    // can't set one). Sent only when auto-unload is checked.
     const options = {};
     if (ttlEnabledInput.checked) {
       const ttl = Math.floor(Number(ttlSecondsInput.value));
@@ -1911,6 +1913,13 @@
       max_tokens: Math.max(1, Math.floor(Number(maxTokensInput.value) || 1024)),
       ...(reasoningEffortValue() ? { reasoning_effort: reasoningEffortValue() } : {}),
       ...(docIds.size ? { doc_ids: [...docIds] } : {}),
+      // Drive LM Studio's idle auto-unload from the load panel's TTL control.
+      // It only takes effect when this message JIT-loads the model; an
+      // already-loaded instance keeps the TTL it was loaded with. Unchecked
+      // sends 0 to disable auto-unload.
+      ttl_seconds: ttlEnabledInput.checked
+        ? Math.max(1, Math.floor(Number(ttlSecondsInput.value) || 1))
+        : 0,
     };
 
     // Lazily built structure inside the assistant bubble: an optional

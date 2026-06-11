@@ -118,11 +118,13 @@
       </div>
 
       <div class="load-options">
-        <label class="load-option checkbox-option">
+        <label class="load-option checkbox-option"
+               title="Unload the model after it sits idle for the TTL below. Applied on manual load via the lms CLI, and on models first loaded by a chat message.">
           <input type="checkbox" id="ttl-enabled" checked>
           Auto-unload after idle
         </label>
-        <label class="load-option">
+        <label class="load-option"
+               title="Idle seconds before LM Studio unloads the model.">
           TTL (seconds)
           <input type="number" id="ttl-seconds" min="1" step="1" value="600">
         </label>

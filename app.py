@@ -41,7 +41,9 @@ import json
 import logging
 import math
 import os
+import shutil
 import sqlite3
+import subprocess
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
@@ -86,6 +88,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default_context_length": None,
         "load_timeout_seconds": 600,
         "status_refresh_seconds": 10,
+        # Path to LM Studio's `lms` CLI. The REST load endpoint can't set a TTL,
+        # so manual loads shell out to `lms load --ttl` when this binary is
+        # found; null/missing falls back to a REST load (context length only).
+        "lms_cli_path": None,
     },
     "image_generation": {
         "api_base_url": None,
@@ -105,7 +111,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chunk_chars": 1200,
         "chunk_overlap": 200,
         "top_k": 5,
-        "embedding_ttl_seconds": 600,
     },
     "tls": {
         "enabled": False,
@@ -199,10 +204,15 @@ class ChatRequest(BaseModel):
     # RAG document ids; relevant chunks are retrieved and prepended to the
     # last user turn instead of inlining whole documents.
     doc_ids: Optional[list[str]] = Field(default=None)
+    # Idle TTL (seconds) for LM Studio to apply when this request JIT-loads the
+    # model. None means "use the configured default"; 0 disables auto-unload.
+    ttl_seconds: Optional[int] = Field(default=None, ge=0, le=86400 * 7)
 
 
 class LoadModelRequest(BaseModel):
     model: str = Field(min_length=1)
+    # TTL is honored only when loading via the `lms` CLI; a REST load ignores it
+    # (the native endpoint has no TTL field). None = use the configured default.
     ttl_seconds: Optional[int] = Field(default=None, ge=1, le=86400 * 7)
     context_length: Optional[int] = Field(default=None, ge=1, le=10_000_000)
 
@@ -784,19 +794,52 @@ def chunk_text(text: str, size: int, overlap: int) -> list[str]:
     return chunks
 
 
+def ensure_embedding_model_loaded() -> None:
+    """Pre-load the embedding model with the configured TTL if it isn't loaded.
+
+    The /v1/embeddings endpoint ignores a "ttl" field, so letting it JIT-load the
+    model leaves it resident with no idle timeout. Loading it ourselves via `lms`
+    first gives it the default TTL. Only loads when not already loaded — a second
+    `lms load` would spawn a duplicate instance rather than refresh the TTL.
+
+    Best-effort: any failure (CLI missing, lms error) is logged and we fall back
+    to letting the embedding request JIT-load the model the old way.
+    """
+    mgmt = CONFIG["model_management"]
+    if not (mgmt.get("auto_unload_by_default") and mgmt.get("default_ttl_seconds")):
+        return  # auto-unload off — nothing to set, leave loading to the request
+    model = CONFIG["rag"]["embedding_model"]
+    try:
+        already_loaded = any(
+            m.get("key") == model and m.get("loaded_instances")
+            for m in fetch_native_models()
+        )
+    except httpx.HTTPError:
+        return  # can't tell; let the embedding request handle loading
+    if already_loaded:
+        return
+    try:
+        load_via_lms(model, mgmt["default_ttl_seconds"], None)
+        logger.info("Pre-loaded embedding model %s with ttl=%s",
+                    model, mgmt["default_ttl_seconds"])
+    except FileNotFoundError:
+        logger.warning(
+            "lms CLI not found; embedding model %s will load without a TTL. "
+            "Set model_management.lms_cli_path to enable it.", model)
+    except RuntimeError as exc:
+        logger.warning("Could not pre-load embedding model %s with a TTL: %s",
+                       model, exc)
+
+
 def embed_texts(inputs: list[str]) -> Optional[list[list[float]]]:
     """Embed inputs via LM Studio; returns None if the embedding API fails."""
-    # When LM Studio JIT-loads the embedding model for this request, tell it the
-    # configured idle TTL so the model auto-unloads like UI-loaded models do.
-    # Without this LM Studio keeps the JIT-loaded model resident indefinitely.
-    extra_body: dict[str, Any] = {}
-    ttl_seconds = CONFIG["rag"].get("embedding_ttl_seconds")
-    if ttl_seconds is not None:
-        extra_body["ttl"] = ttl_seconds
+    # The /v1/embeddings endpoint can't set a TTL, so when the model isn't loaded
+    # yet, pre-load it via `lms` with the configured default TTL — otherwise a
+    # file upload would leave the embedding model resident with no idle timeout.
+    ensure_embedding_model_loaded()
     try:
         response = client.embeddings.create(
-            model=CONFIG["rag"]["embedding_model"], input=inputs,
-            extra_body=extra_body or None)
+            model=CONFIG["rag"]["embedding_model"], input=inputs)
     except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
         logger.warning("Embedding request failed: %s", getattr(exc, "message", exc))
         return None
@@ -1002,6 +1045,98 @@ def model_max_context_length(model_key: str) -> Optional[int]:
     return None
 
 
+def resolve_lms_cli() -> Optional[str]:
+    """Locate LM Studio's `lms` CLI, or None if it can't be found.
+
+    Prefers the configured path, then $PATH, then LM Studio's default install
+    location. The CLI is needed because the REST load endpoint can't set a TTL.
+    """
+    configured = CONFIG["model_management"].get("lms_cli_path")
+    if configured:
+        return configured if os.path.isfile(configured) else None
+    found = shutil.which("lms")
+    if found:
+        return found
+    default = os.path.expanduser("~/.lmstudio/bin/lms")
+    return default if os.path.isfile(default) else None
+
+
+def load_via_lms(model: str, ttl: Optional[int], context_length: Optional[int]) -> None:
+    """Load a model through `lms load`, raising RuntimeError on failure.
+
+    Unlike the REST endpoint, `lms load` can set both a TTL and a context length
+    on the loaded instance.
+    """
+    lms = resolve_lms_cli()
+    if lms is None:
+        raise FileNotFoundError("lms CLI not found")
+    cmd = [lms, "load", model, "--yes"]
+    if ttl:
+        cmd += ["--ttl", str(ttl)]
+    if context_length:
+        cmd += ["--context-length", str(context_length)]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=CONFIG["model_management"]["load_timeout_seconds"],
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"lms load timed out after {exc.timeout:.0f}s") from exc
+    if result.returncode != 0:
+        raise RuntimeError(parse_lms_error(result.stderr or result.stdout or ""))
+
+
+def parse_lms_error(output: str) -> str:
+    """Pull the human-readable error out of `lms` output.
+
+    `lms` prints the error first, then boilerplate suggestions ("To see a list…",
+    indented command examples). Keep the leading message lines and drop the rest.
+    """
+    message_lines: list[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("To ") or raw.startswith("    "):  # suggestion boilerplate
+            break
+        message_lines.append(line)
+    return " ".join(message_lines) or "lms load failed"
+
+
+def lms_remaining_ttl_seconds() -> dict[str, int]:
+    """Map loaded-instance identifier -> remaining idle TTL (seconds), via `lms ps`.
+
+    LM Studio's REST model list omits remaining_ttl_seconds for embedding
+    instances even when a TTL is set, so the UI can't show it. `lms ps --json`
+    reports ttlMs + lastUsedTime for every type; we derive the live countdown.
+    Best-effort: returns {} if the CLI is missing or anything goes wrong.
+    """
+    lms = resolve_lms_cli()
+    if lms is None:
+        return {}
+    try:
+        result = subprocess.run(
+            [lms, "ps", "--json"], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return {}
+        entries = json.loads(result.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return {}
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    remaining: dict[str, int] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        identifier = entry.get("identifier")
+        ttl_ms = entry.get("ttlMs")
+        last_used = entry.get("lastUsedTime")
+        if not identifier or not ttl_ms or last_used is None:
+            continue
+        seconds = round((ttl_ms - (now_ms - last_used)) / 1000)
+        remaining[identifier] = max(0, seconds)
+    return remaining
+
+
 def native_error_message(response: httpx.Response) -> str:
     """Extract a human-readable message from a native API error response."""
     try:
@@ -1056,6 +1191,17 @@ def manage_models() -> JSONResponse:
         logger.exception("LM Studio returned an error while fetching model status")
         return JSONResponse(status_code=502, content={"error": native_error_message(exc.response)})
 
+    # The REST list omits remaining_ttl_seconds for embedding instances, so fill
+    # the gap from `lms ps` (which reports a TTL for every instance type). Only
+    # shell out when some loaded instance is actually missing its TTL, to avoid a
+    # subprocess on every poll when there's nothing to backfill.
+    needs_ttl_lookup = any(
+        instance.get("remaining_ttl_seconds") is None
+        for model in raw_models
+        for instance in model.get("loaded_instances", [])
+    )
+    lms_ttls = lms_remaining_ttl_seconds() if needs_ttl_lookup else {}
+
     models = [
         {
             "key": model.get("key"),
@@ -1071,8 +1217,13 @@ def manage_models() -> JSONResponse:
                     "id": instance.get("id"),
                     "context_length": (instance.get("config") or {}).get("context_length"),
                     # LM Studio reports the live countdown to auto-eviction; absent
-                    # when the instance was loaded without a TTL.
-                    "remaining_ttl_seconds": instance.get("remaining_ttl_seconds"),
+                    # when the instance has no TTL, and always absent for embedding
+                    # instances — so fall back to the value derived from `lms ps`.
+                    "remaining_ttl_seconds": (
+                        instance.get("remaining_ttl_seconds")
+                        if instance.get("remaining_ttl_seconds") is not None
+                        else lms_ttls.get(instance.get("id"))
+                    ),
                 }
                 for instance in model.get("loaded_instances", [])
             ],
@@ -1085,10 +1236,6 @@ def manage_models() -> JSONResponse:
 
 @app.post("/api/models/load")
 def load_model(request: LoadModelRequest) -> JSONResponse:
-    payload: dict[str, Any] = {"model": request.model}
-    if request.ttl_seconds is not None:
-        payload["ttl_seconds"] = request.ttl_seconds
-
     # Resolve the context length to use. An explicit request wins; otherwise fall
     # back to the configured default, and finally to the model's own maximum.
     # Without this, LM Studio loads every model at a hardcoded 8192 rather than
@@ -1098,6 +1245,38 @@ def load_model(request: LoadModelRequest) -> JSONResponse:
         context_length = CONFIG["model_management"].get("default_context_length")
     if context_length is None:
         context_length = model_max_context_length(request.model)
+
+    # Resolve the idle TTL: explicit request wins, else the configured default
+    # (only when auto-unload is on). 0/None means no TTL.
+    mgmt = CONFIG["model_management"]
+    ttl = request.ttl_seconds
+    if ttl is None and mgmt.get("auto_unload_by_default"):
+        ttl = mgmt.get("default_ttl_seconds")
+
+    # The REST load endpoint can't set a TTL (it rejects a "ttl" key), so when a
+    # TTL is wanted we load through the `lms` CLI, which sets both TTL and context
+    # length. Without a TTL — or if the CLI is missing — fall back to REST.
+    if ttl:
+        try:
+            load_via_lms(request.model, ttl, context_length)
+        except FileNotFoundError:
+            logger.warning(
+                "lms CLI not found; loading %s via REST without a TTL. "
+                "Set model_management.lms_cli_path to enable TTL on manual loads.",
+                request.model)
+        except RuntimeError as exc:
+            logger.error("Failed to load %s via lms: %s", request.model, exc)
+            return JSONResponse(status_code=502, content={"error": str(exc)})
+        else:
+            logger.info("Loaded model %s via lms (ttl=%s, context_length=%s)",
+                        request.model, ttl, context_length)
+            return JSONResponse(content={
+                "model": request.model,
+                "ttl_seconds": ttl,
+                "context_length": context_length,
+            })
+
+    payload: dict[str, Any] = {"model": request.model}
     if context_length is not None:
         payload["context_length"] = context_length
     try:
@@ -1112,8 +1291,8 @@ def load_model(request: LoadModelRequest) -> JSONResponse:
     if response.is_error:
         logger.error("Failed to load %s: %s", request.model, response.text)
         return JSONResponse(status_code=502, content={"error": native_error_message(response)})
-    logger.info("Loaded model %s (ttl=%s, context_length=%s)",
-                request.model, request.ttl_seconds, context_length)
+    logger.info("Loaded model %s via REST (context_length=%s, no ttl)",
+                request.model, context_length)
     return JSONResponse(content=response.json())
 
 
@@ -1210,6 +1389,18 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
         extra_body: dict[str, Any] = {}
         if request.reasoning_effort:
             extra_body["reasoning_effort"] = request.reasoning_effort
+        # Attach the idle TTL so a model first loaded by this message auto-unloads.
+        # LM Studio applies a request's ttl only when the request JIT-loads the
+        # model — an already-loaded instance keeps whatever TTL it loaded with
+        # (the load button handles that case via the lms CLI). The request's
+        # ttl_seconds (from the UI's auto-unload control) wins; otherwise fall
+        # back to the configured default. 0 means auto-unload off, so omit ttl.
+        mgmt = CONFIG["model_management"]
+        ttl = request.ttl_seconds
+        if ttl is None and mgmt.get("auto_unload_by_default"):
+            ttl = mgmt.get("default_ttl_seconds")
+        if ttl:
+            extra_body["ttl"] = ttl
         stream = client.chat.completions.create(
             model=request.model,
             messages=outgoing,

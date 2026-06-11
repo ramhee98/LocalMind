@@ -14,7 +14,8 @@
     "auto_unload_by_default": true,
     "default_context_length": null,
     "load_timeout_seconds": 600,
-    "status_refresh_seconds": 10
+    "status_refresh_seconds": 10,
+    "lms_cli_path": null
   },
   "image_generation": {
     "api_base_url": null,
@@ -32,8 +33,7 @@
     "min_chars_for_rag": 8000,
     "chunk_chars": 1200,
     "chunk_overlap": 200,
-    "top_k": 5,
-    "embedding_ttl_seconds": 600
+    "top_k": 5
   },
   "tls": {
     "enabled": false,
