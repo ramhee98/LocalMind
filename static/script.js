@@ -493,6 +493,19 @@
       }
       name.appendChild(badge);
 
+      // Capability badges from LM Studio's reported model capabilities.
+      const caps = model.capabilities || {};
+      const capBadges = [];
+      if (caps.vision) capBadges.push("vision");
+      if (caps.trained_for_tool_use) capBadges.push("tools");
+      if (caps.reasoning) capBadges.push("reasoning");
+      for (const cap of capBadges) {
+        const capBadge = document.createElement("span");
+        capBadge.className = "badge capability";
+        capBadge.textContent = cap;
+        name.appendChild(capBadge);
+      }
+
       const meta = document.createElement("div");
       meta.className = "model-meta";
       meta.textContent = [

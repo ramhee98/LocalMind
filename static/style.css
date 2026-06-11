@@ -633,6 +633,12 @@ input[type="number"] {
   border: 1px solid rgba(217, 184, 108, 0.4);
 }
 
+.badge.capability {
+  color: var(--text-muted);
+  background: rgba(108, 140, 255, 0.1);
+  border: 1px solid rgba(108, 140, 255, 0.32);
+}
+
 .models-summary {
   margin: 12px 2px 2px;
   font-size: 0.78rem;
