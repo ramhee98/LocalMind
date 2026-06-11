@@ -39,6 +39,17 @@
                 title="Manage models" aria-label="Toggle model management panel">📦</button>
         <button id="settings-toggle" class="icon-button" type="button"
                 title="Settings" aria-label="Toggle settings panel">⚙</button>
+        <div class="export-wrap">
+          <button id="export-toggle" class="icon-button" type="button"
+                  title="Export conversation" aria-label="Export conversation"
+                  aria-haspopup="true" aria-expanded="false" disabled>📤</button>
+          <div id="export-menu" class="export-menu hidden" role="menu"
+               aria-label="Export format">
+            <button type="button" role="menuitem" data-format="markdown">Markdown (.md)</button>
+            <button type="button" role="menuitem" data-format="json">JSON (.json)</button>
+            <button type="button" role="menuitem" data-format="pdf">PDF (print)</button>
+          </div>
+        </div>
         <button id="clear-chat" class="icon-button" type="button"
                 title="New chat" aria-label="Clear conversation">🗑</button>
       </div>
@@ -159,6 +170,9 @@
   </div>
 
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <!-- Filled in only while exporting to PDF; printed via the browser, then cleared. -->
+  <div id="print-root" class="print-root" aria-hidden="true"></div>
 
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/purify.min.js"></script>

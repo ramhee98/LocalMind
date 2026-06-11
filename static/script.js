@@ -4,6 +4,9 @@
   const modelSelect = document.getElementById("model-select");
   const settingsToggle = document.getElementById("settings-toggle");
   const settingsPanel = document.getElementById("settings-panel");
+  const exportToggle = document.getElementById("export-toggle");
+  const exportMenu = document.getElementById("export-menu");
+  const printRoot = document.getElementById("print-root");
   const clearChatButton = document.getElementById("clear-chat");
   const errorBanner = document.getElementById("error-banner");
   const errorText = document.getElementById("error-text");
@@ -65,6 +68,8 @@
   let attachmentCounter = 0;
   /** Server-side conversation id; created lazily on the first exchange. */
   let currentConversationId = null;
+  /** Title of the open conversation, used to name exported files. */
+  let currentTitle = "";
   /** RAG document ids attached this session, retrieved on each chat turn. */
   let docIds = new Set();
   /** Model keys / instance ids with an in-flight load or unload request. */
@@ -884,10 +889,12 @@
     attachments = [];
     docIds = new Set();
     currentConversationId = null;
+    currentTitle = "";
     renderAttachments();
     clearChatWindow();
     highlightActiveConversation();
     updateContextMeter();
+    updateExportState();
   }
 
   clearChatButton.addEventListener("click", startNewChat);
@@ -1255,6 +1262,7 @@
     replaceMessageText(messages[index], newText);
     messages = messages.slice(0, index + 1);
     renderConversationHistory();
+    updateExportState();
     hideError();
     isStreaming = true;
     updateSendState();
@@ -1274,6 +1282,7 @@
     }
     messages = messages.slice(0, index);
     renderConversationHistory();
+    updateExportState();
     hideError();
     isStreaming = true;
     updateSendState();
@@ -1288,6 +1297,7 @@
       if (!response.ok) throw new Error(data.error || "Could not load the conversation.");
       messages = Array.isArray(data.messages) ? data.messages : [];
       currentConversationId = id;
+      currentTitle = data.title || "";
       attachments = [];
       // Rehydrate RAG doc ids from saved metadata. After a server restart the
       // in-memory index is gone; retrieval then returns nothing and the model
@@ -1302,6 +1312,7 @@
       renderConversationHistory();
       highlightActiveConversation();
       updateContextMeter();
+      updateExportState();
       closeSidebarOnMobile();
     } catch (error) {
       toast(error.message || "Could not load the conversation.", "error", 6000);
@@ -1340,9 +1351,187 @@
         });
       }
       if (!response.ok) throw new Error(`status ${response.status}`);
+      try {
+        currentTitle = (await response.json()).title || currentTitle;
+      } catch {
+        /* Body already consumed or empty; keep the existing title. */
+      }
+      updateExportState();
       loadConversations();
     } catch {
       toast("This conversation could not be saved.", "error", 6000);
+    }
+  }
+
+  // ---------- Export conversation ----------
+
+  /** The export button only works on a conversation that has messages. */
+  function updateExportState() {
+    if (exportToggle) exportToggle.disabled = !messages.length;
+    if (messages.length === 0) closeExportMenu();
+  }
+
+  function closeExportMenu() {
+    exportMenu.classList.add("hidden");
+    exportToggle.setAttribute("aria-expanded", "false");
+  }
+
+  function toggleExportMenu() {
+    if (exportToggle.disabled) return;
+    const opening = exportMenu.classList.contains("hidden");
+    exportMenu.classList.toggle("hidden", !opening);
+    exportToggle.setAttribute("aria-expanded", String(opening));
+  }
+
+  exportToggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleExportMenu();
+  });
+
+  exportMenu.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-format]");
+    if (!button) return;
+    closeExportMenu();
+    exportConversation(button.dataset.format);
+  });
+
+  // Dismiss the menu on an outside click or Escape.
+  document.addEventListener("click", (event) => {
+    if (!exportMenu.classList.contains("hidden") &&
+        !exportMenu.contains(event.target) && event.target !== exportToggle) {
+      closeExportMenu();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeExportMenu();
+  });
+
+  /** A filesystem-safe slug derived from the conversation title. */
+  function exportFileBase() {
+    const base = (currentTitle || "conversation")
+      .replace(/[\\/:*?"<>|]+/g, "")  // characters illegal in filenames
+      .replace(/\s+/g, "-")
+      .replace(/^[-.]+|[-.]+$/g, "")
+      .slice(0, 80);
+    return base || "conversation";
+  }
+
+  /** Describe a message's attachments for text/markdown exports. */
+  function attachmentSummary(message) {
+    const meta = Array.isArray(message.attachments_meta) ? message.attachments_meta : [];
+    return meta.map((entry) => entry.kind === "image"
+      ? `🖼 ${entry.name || "image"}`
+      : `📄 ${entry.name || "document"}${entry.pages ? ` (${entry.pages} p.)` : ""}`);
+  }
+
+  function conversationToMarkdown() {
+    const lines = [`# ${currentTitle || "Conversation"}`, ""];
+    lines.push(`*Exported from LocalMind on ${new Date().toLocaleString()}*`, "");
+    for (const message of messages) {
+      if (message.role !== "user" && message.role !== "assistant") continue;
+      lines.push(message.role === "user" ? "## 🧑 You" : "## 🤖 Assistant", "");
+      const attachments = attachmentSummary(message);
+      if (attachments.length) {
+        lines.push(attachments.map((tag) => `> ${tag}`).join("\n"), "");
+      }
+      const text = message.display ?? extractMessageText(message.content);
+      lines.push(text || "*(no text content)*", "");
+    }
+    return lines.join("\n");
+  }
+
+  function conversationToJson() {
+    return JSON.stringify({
+      id: currentConversationId,
+      title: currentTitle || "Conversation",
+      exported_at: new Date().toISOString(),
+      messages,
+    }, null, 2);
+  }
+
+  function downloadBlob(text, mimeType, filename) {
+    const blob = new Blob([text], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    // Revoke after the click has been dispatched.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  /**
+   * "Print to PDF": render the conversation into a hidden, print-only node and
+   * invoke the browser's print dialog. The user picks "Save as PDF". This reuses
+   * the sanitized-Markdown renderer for fidelity and needs no extra libraries.
+   */
+  function exportPdf() {
+    printRoot.innerHTML = "";
+    const heading = document.createElement("h1");
+    heading.className = "print-title";
+    heading.textContent = currentTitle || "Conversation";
+    printRoot.appendChild(heading);
+
+    for (const message of messages) {
+      if (message.role !== "user" && message.role !== "assistant") continue;
+      const block = document.createElement("section");
+      block.className = `print-message ${message.role}`;
+
+      const label = document.createElement("div");
+      label.className = "print-role";
+      label.textContent = message.role === "user" ? "You" : "Assistant";
+      block.appendChild(label);
+
+      const attachments = attachmentSummary(message);
+      if (attachments.length) {
+        const tags = document.createElement("div");
+        tags.className = "print-attachments";
+        tags.textContent = attachments.join("  ·  ");
+        block.appendChild(tags);
+      }
+
+      const body = document.createElement("div");
+      const text = message.display ?? extractMessageText(message.content);
+      // Assistant replies are Markdown; user text is shown verbatim.
+      if (message.role === "assistant") {
+        renderMarkdown(body, text, { withCopyButtons: false });
+      } else {
+        body.className = "print-user-text";
+        body.textContent = text;
+      }
+      block.appendChild(body);
+      printRoot.appendChild(block);
+    }
+
+    document.body.classList.add("printing");
+    const cleanup = () => {
+      document.body.classList.remove("printing");
+      printRoot.innerHTML = "";
+      window.removeEventListener("afterprint", cleanup);
+    };
+    window.addEventListener("afterprint", cleanup);
+    window.print();
+    // Safari/Firefox don't always fire afterprint; clear shortly after as a fallback.
+    setTimeout(cleanup, 2000);
+  }
+
+  function exportConversation(format) {
+    if (!messages.length) return;
+    const base = exportFileBase();
+    try {
+      if (format === "markdown") {
+        downloadBlob(conversationToMarkdown(), "text/markdown;charset=utf-8", `${base}.md`);
+        toast("Conversation exported as Markdown.");
+      } else if (format === "json") {
+        downloadBlob(conversationToJson(), "application/json;charset=utf-8", `${base}.json`);
+        toast("Conversation exported as JSON.");
+      } else if (format === "pdf") {
+        exportPdf();
+      }
+    } catch (error) {
+      showError(error.message || "Export failed.");
     }
   }
 

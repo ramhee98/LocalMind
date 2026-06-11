@@ -281,6 +281,44 @@ button:focus-visible {
   border-color: var(--accent);
 }
 
+.icon-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ---------- Export menu ---------- */
+
+.export-wrap { position: relative; }
+
+.export-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  min-width: 168px;
+  padding: 6px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+
+.export-menu button {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+.export-menu button:hover { background: var(--surface); }
+
 /* ---------- Error banner ---------- */
 
 .error-banner {
@@ -1148,4 +1186,67 @@ input[type="number"] {
   .message { max-width: 92%; }
   #model-select { max-width: 150px; }
   .brand h1 { display: none; }
+}
+
+/* ---------- PDF export (print) ---------- */
+
+/* The print container only holds content while a PDF export is in progress. */
+.print-root { display: none; }
+
+@media print {
+  /* Hide the live app; show only the rendered conversation. */
+  body.printing .layout { display: none !important; }
+  body.printing .print-root {
+    display: block;
+    color: #000;
+    background: #fff;
+    font-size: 12pt;
+    line-height: 1.5;
+  }
+
+  .print-title {
+    font-size: 18pt;
+    margin: 0 0 16pt;
+    border-bottom: 1pt solid #999;
+    padding-bottom: 6pt;
+  }
+
+  .print-message {
+    margin: 0 0 14pt;
+    /* Avoid splitting a single turn across pages where possible. */
+    break-inside: avoid;
+  }
+
+  .print-role {
+    font-weight: 700;
+    font-size: 11pt;
+    margin-bottom: 4pt;
+    color: #444;
+  }
+
+  .print-attachments {
+    font-size: 10pt;
+    color: #666;
+    margin-bottom: 4pt;
+  }
+
+  .print-user-text { white-space: pre-wrap; }
+
+  /* Make the sanitized Markdown legible on white paper. */
+  .print-message .md { color: #000; }
+  .print-message .md a { color: #1a4ed8; }
+  .print-message .md code,
+  .print-message .md pre {
+    background: #f4f4f4;
+    border: 1pt solid #ddd;
+    color: #000;
+  }
+  .print-message .md pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .print-message .md table,
+  .print-message .md th,
+  .print-message .md td { border: 1pt solid #999; }
+  .print-message .code-copy { display: none !important; }
 }
