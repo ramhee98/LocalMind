@@ -458,7 +458,15 @@
     let loadedCount = 0;
     let loadedBytes = 0;
 
-    for (const model of models) {
+    // Loaded models first (they're what you're managing), then largest first.
+    const ordered = [...models].sort((a, b) => {
+      const aLoaded = a.loaded_instances.length > 0;
+      const bLoaded = b.loaded_instances.length > 0;
+      if (aLoaded !== bLoaded) return aLoaded ? -1 : 1;
+      return (b.size_bytes || 0) - (a.size_bytes || 0);
+    });
+
+    for (const model of ordered) {
       const isLoaded = model.loaded_instances.length > 0;
       const isBusy = busyModels.has(model.key);
       if (isLoaded) {
