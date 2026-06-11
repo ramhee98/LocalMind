@@ -786,9 +786,17 @@ def chunk_text(text: str, size: int, overlap: int) -> list[str]:
 
 def embed_texts(inputs: list[str]) -> Optional[list[list[float]]]:
     """Embed inputs via LM Studio; returns None if the embedding API fails."""
+    # When LM Studio JIT-loads the embedding model for this request, tell it the
+    # configured idle TTL so the model auto-unloads like UI-loaded models do.
+    # Without this LM Studio keeps the JIT-loaded model resident indefinitely.
+    extra_body: dict[str, Any] = {}
+    ttl_seconds = CONFIG["rag"].get("embedding_ttl_seconds")
+    if ttl_seconds is not None:
+        extra_body["ttl"] = ttl_seconds
     try:
         response = client.embeddings.create(
-            model=CONFIG["rag"]["embedding_model"], input=inputs)
+            model=CONFIG["rag"]["embedding_model"], input=inputs,
+            extra_body=extra_body or None)
     except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
         logger.warning("Embedding request failed: %s", getattr(exc, "message", exc))
         return None
