@@ -1709,6 +1709,60 @@ def apply_web_search(messages: list[dict[str, Any]], query: str) -> list[dict[st
     return prepend_to_last_user_turn(messages, preamble)
 
 
+# ---------- Linked pages (user-pasted URLs) ----------
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+
+# Pages up to this size are inlined whole; larger ones are embed-ranked
+# against the question and only the best excerpts are injected.
+LINKED_PAGE_INLINE_CHARS = 6000
+
+
+def extract_urls(text: str) -> list[str]:
+    """URLs pasted in the message — deduped, order-preserving, capped at 5."""
+    urls: list[str] = []
+    for match in URL_PATTERN.findall(text):
+        url = match.rstrip(".,;:!?")
+        # A trailing ")" is usually prose punctuation — "(see https://x.ch)" —
+        # unless the URL itself contains an opening paren (Wikipedia titles).
+        if url.endswith(")") and "(" not in url:
+            url = url[:-1]
+        if url not in urls:
+            urls.append(url)
+    return urls[:5]
+
+
+def linked_pages_context(query: str, urls: list[str]) -> tuple[str, list[str]]:
+    """Fetch user-pasted URLs; returns (context block, URLs that failed).
+
+    Search engines never index small or new sites, so pasted links are
+    fetched directly instead of searched for. Short pages are inlined whole;
+    long ones are embed-ranked against the question (leading text when
+    embeddings are unavailable).
+    """
+    texts = fetch_page_texts([{"title": url, "url": url, "snippet": ""} for url in urls])
+    rag = CONFIG["rag"]
+    blocks: list[str] = []
+    failed: list[str] = []
+    for url in urls:
+        text = texts.get(url, "")
+        if not text:
+            failed.append(url)
+            continue
+        if len(text) <= LINKED_PAGE_INLINE_CHARS:
+            blocks.append(f"[{url}]\n{text}")
+            continue
+        pool = [({"title": url, "url": url}, chunk)
+                for chunk in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"])]
+        top = rank_chunks_by_query(query, pool, CONFIG["web_search"]["top_k"])
+        if top is None:
+            blocks.append(f"[{url}]\n{text[:LINKED_PAGE_INLINE_CHARS]}")
+        else:
+            excerpts = "\n\n".join(chunk for _, chunk in top)
+            blocks.append(f"[{url}] (most relevant excerpts)\n{excerpts}")
+    return "\n\n".join(blocks), failed
+
+
 # ---------- Web research (multi-round search) ----------
 
 RESEARCH_PLAN_SYSTEM_PROMPT = (
@@ -1894,6 +1948,25 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
         query = last_user_query(outgoing)
         web_config = CONFIG["web_search"]
         mode = request.web_search if (web_config["enabled"] and query) else None
+        # URLs pasted into the message are fetched directly — search engines
+        # don't index small sites, so searching for them finds nothing.
+        have_linked_pages = False
+        urls = extract_urls(query) if mode else []
+        if urls:
+            plural = "s" if len(urls) > 1 else ""
+            yield f"data: {json.dumps({'status': f'🔗 Reading {len(urls)} linked page{plural}…'})}\n\n"
+            page_block, failed = linked_pages_context(query, urls)
+            if failed:
+                notice = "Could not read: " + ", ".join(failed)
+                yield f"data: {json.dumps({'notice': notice})}\n\n"
+            if page_block:
+                have_linked_pages = True
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                preamble = (
+                    f"Content fetched {today} (UTC) from the pages linked in "
+                    "the user's message. Use it to answer and cite the pages "
+                    "as markdown links.\n\n" + page_block + "\n\n")
+                outgoing = prepend_to_last_user_turn(outgoing, preamble)
         search_query = None
         if mode == "search":
             search_query = query
@@ -1914,10 +1987,13 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                 outgoing = apply_web_search(outgoing, search_query)
             except WebSearchError as exc:
                 # Degrade gracefully: surface the failure as a toast and let
-                # the model answer from its own knowledge.
+                # the model answer from its own knowledge. When the message's
+                # linked pages were already fetched, a failed search on top of
+                # them is routine (tiny sites aren't indexed) — log only.
                 logger.warning("Web search failed: %s", exc)
-                notice = f"Web search failed — {exc}. Answering without web results."
-                yield f"data: {json.dumps({'notice': notice})}\n\n"
+                if not have_linked_pages:
+                    notice = f"Web search failed — {exc}. Answering without web results."
+                    yield f"data: {json.dumps({'notice': notice})}\n\n"
         elif mode == "research":
             # Drain the research generator, forwarding its progress statuses;
             # its return value is the assembled context block.
@@ -1939,7 +2015,7 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                     "sources inline as markdown links, and note anything the "
                     "findings leave open.\n\n" + research_block + "\n\n")
                 outgoing = prepend_to_last_user_turn(outgoing, preamble)
-            else:
+            elif not have_linked_pages:
                 notice = "Web research found no usable sources. Answering without web results."
                 yield f"data: {json.dumps({'notice': notice})}\n\n"
         extra_body: dict[str, Any] = {}

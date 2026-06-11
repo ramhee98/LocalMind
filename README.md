@@ -26,7 +26,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Edit & regenerate** — hover any of your messages to ✏️ edit it (attachments are preserved) or any answer to ↻ regenerate it; the conversation is truncated at that point and re-streamed, with a confirmation if later messages would be discarded.
 - **Context-window meter** — a gauge in the composer estimates the prompt size (system prompt, history, attachments, retrieved RAG chunks, and your draft) against the loaded model's actual context window, turning yellow at 80% and red at 95%.
 - **Document retrieval (RAG)** — long uploads are chunked, embedded with a local embedding model, and queried by relevance per question (only the top matches enter the prompt) — so you can chat about a big PDF without blowing the context window. Small docs are still inlined.
-- **Web search & research (🌐)** — a Web control in the composer grounds answers in live web results, in two modes. *Search*: the chat model distills your question (with conversation context, so follow-ups work) into a search query, the top result pages are downloaded and embed-ranked against it with the local embedding model, and the best excerpts are injected into the prompt with sources cited inline as links. *Research*: a bounded multi-round pipeline — the model plans sub-queries, results are LLM-filtered for relevance and their pages read, the model reviews the findings for gaps and searches again, and everything is synthesized into a structured, cited answer (slower, deeper). Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
+- **Web search & research (🌐)** — a Web control in the composer grounds answers in live web results, in two modes. *Search*: the chat model distills your question (with conversation context, so follow-ups work) into a search query, the top result pages are downloaded and embed-ranked against it with the local embedding model, and the best excerpts are injected into the prompt with sources cited inline as links. *Research*: a bounded multi-round pipeline — the model plans sub-queries, results are LLM-filtered for relevance and their pages read, the model reviews the findings for gaps and searches again, and everything is synthesized into a structured, cited answer (slower, deeper). In either mode, URLs pasted into the message are fetched directly and their content injected, so you can ask about pages search engines don't index. Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -156,6 +156,8 @@ Small attached documents are inlined into the prompt as before. Documents at lea
 
 Set the **🌐 Web** control in the composer to *Search* or *Research* to ground answers in live web results.
 
+**Pasted links are fetched directly** (in either mode): URLs in your message are downloaded and their content injected into the prompt — search engines don't index small or new sites, so asking about one would otherwise find nothing. Short pages are inlined whole; long ones are embed-ranked against your question. Links that can't be fetched are reported in a toast.
+
 **Search** runs a quick pipeline (~5–10s):
 
 1. **Query rewriting** — the selected chat model distills your message and the recent turns into a concise search query (one quick `reasoning_effort: none` call), so conversational phrasing and follow-ups like *"and what about the next one?"* still search well.
@@ -187,7 +189,9 @@ Configured under `web_search` in `config.json`:
 
 If a search fails (offline, rate-limited, misconfigured), a toast explains why and the model answers from its own knowledge instead of erroring. The same applies piecewise further down the pipeline: if the query rewrite fails the raw question is searched, and if page downloads or the embedding model are unavailable the snippets alone are injected.
 
-> Note: web search sends your (rewritten) question to the search provider (DuckDuckGo, or your SearXNG instance and the engines it queries), and the result pages are fetched from their sites. Leave the toggle off for conversations that should stay fully local.
+> Note: web search sends your (rewritten) question to the search provider (DuckDuckGo, or your SearXNG instance and the engines it queries), and the result pages are fetched from their sites. Leave the control off for conversations that should stay fully local.
+
+> Note: fetching modern sites requires a Python built with TLS 1.3 support. Apple's CommandLineTools Python is built against LibreSSL 2.8 (no TLS 1.3) and fails on many sites with `TLSV1_ALERT_PROTOCOL_VERSION`; use a python.org or Homebrew build (which also satisfies the 3.10+ requirement) for the virtualenv.
 
 ### Attaching files and images
 
