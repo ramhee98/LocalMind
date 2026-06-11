@@ -53,6 +53,8 @@
   let messages = [];
   let systemPrompt = "";
   let isStreaming = false;
+  /** Abort handle for the in-flight chat stream; null when not streaming. */
+  let chatAbortController = null;
   let statusRefreshSeconds = 10;
   let statusRefreshTimer = null;
   let imageMode = false;
@@ -504,6 +506,15 @@
   }
 
   function updateSendState() {
+    // While a chat reply streams, the button becomes an always-enabled Stop.
+    if (isStreaming && chatAbortController) {
+      sendButton.disabled = false;
+      sendButton.textContent = "⏹ Stop";
+      sendButton.classList.add("stop");
+      updateContextMeter();
+      return;
+    }
+    sendButton.classList.remove("stop");
     const uploading = attachments.some((doc) => doc.uploading);
     sendButton.disabled =
       isStreaming || uploading || !messageInput.value.trim() ||
@@ -786,7 +797,13 @@
     }
   });
 
-  sendButton.addEventListener("click", sendMessage);
+  sendButton.addEventListener("click", () => {
+    if (isStreaming && chatAbortController) {
+      chatAbortController.abort();
+      return;
+    }
+    sendMessage();
+  });
   modelSelect.addEventListener("change", updateSendState);
 
   // ---------- Conversations (server-side persistence) ----------
@@ -1355,6 +1372,9 @@
     assistantBubble.classList.add("pending");
     let assistantContent = "";
 
+    chatAbortController = new AbortController();
+    updateSendState();
+
     const payload = {
       model: modelSelect.value,
       messages: systemPrompt
@@ -1410,6 +1430,7 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: chatAbortController.signal,
       });
       if (!response.ok || !response.body) {
         let detail = `Request failed with status ${response.status}.`;
@@ -1467,8 +1488,14 @@
       } else {
         assistantBubble.remove();
       }
-      showError(error.message || "The request to the server failed.");
+      if (error.name === "AbortError") {
+        // Stopped by the user: keep whatever streamed in, no error banner.
+        finishThinking();
+      } else {
+        showError(error.message || "The request to the server failed.");
+      }
     } finally {
+      chatAbortController = null;
       assistantBubble.classList.remove("pending");
       isStreaming = false;
       updateSendState();

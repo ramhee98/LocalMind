@@ -1002,6 +1002,10 @@ input[type="number"] {
   cursor: not-allowed;
 }
 
+#send-button.stop {
+  background: linear-gradient(135deg, #e25b4a, var(--error));
+}
+
 .hidden { display: none !important; }
 
 /* ---------- Responsive ---------- */

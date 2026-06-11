@@ -1035,6 +1035,7 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
     Errors are reported as an SSE `error` field because the HTTP status
     is already committed once streaming has started.
     """
+    stream = None
     try:
         outgoing = [message.model_dump() for message in request.messages]
         if request.doc_ids:
@@ -1061,6 +1062,13 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
             if delta.content:
                 yield f"data: {json.dumps({'content': delta.content})}\n\n"
         yield "data: [DONE]\n\n"
+    except GeneratorExit:
+        # The client disconnected (stop button, closed tab). Re-raise so the
+        # generator shuts down; `finally` closes the upstream connection,
+        # which makes LM Studio abort the generation instead of completing
+        # it in the background.
+        logger.info("Chat stream cancelled by the client.")
+        raise
     except (APIConnectionError, APITimeoutError):
         logger.exception("LM Studio unreachable during chat completion")
         yield f"data: {json.dumps(connection_error_payload())}\n\n"
@@ -1070,6 +1078,9 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
     except Exception:  # noqa: BLE001 — never leak a raw traceback into the stream
         logger.exception("Unexpected error during chat completion")
         yield f"data: {json.dumps({'error': 'Unexpected server error. Check the application logs.'})}\n\n"
+    finally:
+        if stream is not None:
+            stream.close()
 
 
 @app.post("/api/chat")
