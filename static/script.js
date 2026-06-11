@@ -518,8 +518,15 @@
           const line = document.createElement("div");
           line.className = "model-instance";
           const label = document.createElement("span");
+          // Token usage is only meaningful for the model the chat is pointed at,
+          // since that's the prompt we can measure.
+          const isActiveChatModel = instance.id === modelSelect.value;
+          const ctxText = instance.context_length
+            ? `ctx ${formatContext(instance.context_length)}` +
+              (isActiveChatModel ? ` (≈${formatTokens(estimateUsedTokens())} used)` : "")
+            : "";
           const details = [
-            instance.context_length ? `ctx ${formatContext(instance.context_length)}` : "",
+            ctxText,
             instance.remaining_ttl_seconds != null
               ? `ttl ${formatDuration(instance.remaining_ttl_seconds)}`
               : "no ttl",
@@ -702,12 +709,8 @@
     updateContextMeter();
   }
 
-  function updateContextMeter() {
-    const limit = contextWindows[modelSelect.value];
-    if (!limit) {
-      contextMeter.classList.add("hidden");
-      return;
-    }
+  /** Estimated tokens in the current prompt: system, history, draft, attachments, RAG. */
+  function estimateUsedTokens() {
     let used = estimateTokens(systemPrompt);
     for (const message of messages) used += estimateMessageTokens(message);
     used += estimateTokens(messageInput.value);
@@ -719,6 +722,16 @@
     if (docIds.size && ragEstimate.top_k) {
       used += Math.ceil((ragEstimate.top_k * ragEstimate.chunk_chars) / CHARS_PER_TOKEN);
     }
+    return used;
+  }
+
+  function updateContextMeter() {
+    const limit = contextWindows[modelSelect.value];
+    if (!limit) {
+      contextMeter.classList.add("hidden");
+      return;
+    }
+    const used = estimateUsedTokens();
     const percent = Math.min(100, Math.round((used / limit) * 100));
     contextMeterFill.style.width = `${percent}%`;
     contextMeterFill.classList.toggle("warn", percent >= 80 && percent < 95);
