@@ -26,7 +26,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Edit & regenerate** — hover any of your messages to ✏️ edit it (attachments are preserved) or any answer to ↻ regenerate it; the conversation is truncated at that point and re-streamed, with a confirmation if later messages would be discarded.
 - **Context-window meter** — a gauge in the composer estimates the prompt size (system prompt, history, attachments, retrieved RAG chunks, and your draft) against the loaded model's actual context window, turning yellow at 80% and red at 95%.
 - **Document retrieval (RAG)** — long uploads are chunked, embedded with a local embedding model, and queried by relevance per question (only the top matches enter the prompt) — so you can chat about a big PDF without blowing the context window. Small docs are still inlined.
-- **Web search (🌐 toggle)** — flip the composer toggle to search the web for your question and inject the top results into the prompt, with sources cited inline as links. Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
+- **Web search (🌐 toggle)** — flip the composer toggle to ground answers in live web results: the chat model first distills your question (with conversation context, so follow-ups work) into a search query, the top result pages are downloaded and embed-ranked against it with the local embedding model, and the best excerpts are injected into the prompt with sources cited inline as links. Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -154,18 +154,27 @@ Small attached documents are inlined into the prompt as before. Documents at lea
 
 ### Web search
 
-Turn on the **🌐 Web search** toggle in the composer to ground answers in live web results: your question is searched, and the top hits (title, URL, snippet) are injected into the prompt — the model is asked to cite the sources it uses as inline links. The toggle state is remembered across reloads, and a "Searching the web…" note shows in the reply bubble while the search runs.
+Turn on the **🌐 Web search** toggle in the composer to ground answers in live web results. Each search runs a small pipeline:
+
+1. **Query rewriting** — the selected chat model distills your message and the recent turns into a concise search query (one quick `reasoning_effort: none` call), so conversational phrasing and follow-ups like *"and what about the next one?"* still search well.
+2. **Search** — the query goes to the configured provider: DuckDuckGo via the [ddgs](https://pypi.org/project/ddgs/) package (default, no API key) or a self-hosted SearXNG instance.
+3. **Read & rank** — the top result pages are downloaded in parallel, stripped to text, chunked, and ranked against the query with the same local embedding model RAG uses; the result snippets plus the most relevant page excerpts are injected into the prompt, and the model is asked to cite sources as inline links.
+
+Status notes ("Preparing web search…", "Searching the web…") show in the reply bubble while this runs, and the toggle state is remembered across reloads.
 
 Configured under `web_search` in `config.json`:
 
 - `provider` — `duckduckgo` (default, no API key or setup needed) or `searxng`.
 - `searxng_base_url` — your [SearXNG](https://docs.searxng.org/) instance, e.g. `http://localhost:8888`, if you prefer to keep search queries on infrastructure you control. The instance must allow the JSON output format (`formats: [html, json]` in its `settings.yml`).
-- `max_results` / `timeout_seconds` — how many results to inject and how long to wait.
+- `backends` — engine order for ddgs (default `duckduckgo, brave, bing`). Unknown names make ddgs fall back to its full random rotation, which includes weaker engines.
+- `rewrite_query` — set `false` to search with the raw chat message instead of the LLM-rewritten query (faster, noticeably worse for conversational questions).
+- `fetch_pages` — set `false` to inject only the search snippets without downloading pages (faster, shallower answers). `top_k` controls how many ranked page excerpts are injected and `max_page_chars` how much text per page is considered.
+- `max_results` / `timeout_seconds` — how many search results to use and how long to wait.
 - `enabled: false` hides the toggle entirely.
 
-If a search fails (offline, rate-limited, misconfigured), a toast explains why and the model answers from its own knowledge instead of erroring.
+If a search fails (offline, rate-limited, misconfigured), a toast explains why and the model answers from its own knowledge instead of erroring. The same applies piecewise further down the pipeline: if the query rewrite fails the raw question is searched, and if page downloads or the embedding model are unavailable the snippets alone are injected.
 
-> Note: web search sends your question to the search provider (DuckDuckGo, or your SearXNG instance and the engines it queries). Leave the toggle off for conversations that should stay fully local.
+> Note: web search sends your (rewritten) question to the search provider (DuckDuckGo, or your SearXNG instance and the engines it queries), and the result pages are fetched from their sites. Leave the toggle off for conversations that should stay fully local.
 
 ### Attaching files and images
 

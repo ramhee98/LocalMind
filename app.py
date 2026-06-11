@@ -45,8 +45,10 @@ import shutil
 import sqlite3
 import subprocess
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
 
@@ -120,8 +122,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # requires searxng_base_url (the instance must allow format=json).
         "provider": "duckduckgo",
         "searxng_base_url": None,
+        # ddgs engine order ("auto" rotates randomly, which mixes in weak
+        # engines — fuzzy Wikipedia title matches and the like). Must use
+        # names ddgs knows, or it silently falls back to "auto".
+        "backends": "duckduckgo, brave, bing",
         "max_results": 5,
         "timeout_seconds": 15,
+        # Distill the conversation into a search query with the chat model
+        # first; the raw chat message makes a poor query ("In one sentence,
+        # what …?") and follow-ups lack context entirely.
+        "rewrite_query": True,
+        # Download the top result pages and embed-rank their text against the
+        # query (the RAG pipeline); off injects only the search snippets.
+        "fetch_pages": True,
+        # How many page chunks to inject when fetch_pages is on.
+        "top_k": 6,
+        # Extracted text per page is capped at this many characters.
+        "max_page_chars": 20000,
     },
     "tls": {
         "enabled": False,
@@ -1419,7 +1436,8 @@ def search_duckduckgo(query: str, max_results: int) -> list[dict[str, str]]:
     for _ in range(2):
         try:
             with DDGS(timeout=CONFIG["web_search"]["timeout_seconds"]) as ddgs:
-                raw = ddgs.text(query, max_results=max_results)
+                raw = ddgs.text(query, max_results=max_results,
+                                backend=CONFIG["web_search"]["backends"])
             break
         except Exception as exc:  # noqa: BLE001 — ddgs raises library-specific errors
             last_error = exc
@@ -1471,25 +1489,188 @@ def run_web_search(query: str) -> list[dict[str, str]]:
     raise WebSearchError(f"unknown web search provider: {provider}")
 
 
+SEARCH_QUERY_SYSTEM_PROMPT = (
+    "You turn chat messages into web search queries. Given a conversation, "
+    "write one concise search query (a few keywords, no quotes, no boolean "
+    "operators) that would find the information needed to answer the user's "
+    "last message. Resolve pronouns and follow-up references from the "
+    "conversation so the query stands on its own. Reply with the query text "
+    "only — no explanations."
+)
+
+
+def rewrite_search_query(model: str, messages: list[dict[str, Any]], fallback: str) -> str:
+    """Distill the conversation's last question into a short search query.
+
+    Chat messages make poor queries verbatim, and follow-ups ("what about in
+    winter?") are meaningless without the preceding turns. Falls back to the
+    raw question on any failure — a usable query beats no search.
+    """
+    lines = []
+    for message in messages[-6:]:
+        if message.get("role") not in ("user", "assistant"):
+            continue
+        text = message_text(message).strip()
+        if not text:
+            continue
+        # Keep the tail: attachment text is prepended, the question comes last.
+        lines.append(f"{message['role']}: {text[-800:]}")
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SEARCH_QUERY_SYSTEM_PROMPT},
+                {"role": "user", "content": "\n\n".join(lines)},
+            ],
+            temperature=0.0,
+            max_tokens=200,
+            # Reasoning models would otherwise spend the budget thinking.
+            extra_body={"reasoning_effort": "none"},
+        )
+    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+        logger.warning("Search query rewrite failed: %s", getattr(exc, "message", exc))
+        return fallback
+    text = (completion.choices[0].message.content or "").strip()
+    # Some reasoning models emit a <think>...</think> block before the answer.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1].strip()
+    text = " ".join(text.split()).strip("\"'")
+    if not text or len(text) > 200:
+        return fallback
+    return text
+
+
+class _PageTextExtractor(HTMLParser):
+    """Collect the readable text of an HTML page.
+
+    Only reliably-closed non-content containers are skipped; boilerplate like
+    nav/footer text is left in because malformed pages often leave those tags
+    unclosed (which would swallow the whole document) — the embedding reranker
+    sorts low-value chunks out anyway.
+    """
+
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "template", "head"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth and data.strip():
+            self.parts.append(data.strip())
+
+
+def extract_page_text(html: str) -> str:
+    parser = _PageTextExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:  # noqa: BLE001 — never let a weird page kill the search
+        pass
+    return "\n".join(parser.parts)
+
+
+def fetch_page_texts(results: list[dict[str, str]]) -> dict[str, str]:
+    """Download the result pages concurrently; failures are skipped."""
+    config = CONFIG["web_search"]
+    headers = {
+        # Some sites reject the default httpx user agent outright.
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36"),
+        "Accept-Language": "en",
+    }
+
+    def fetch(url: str) -> str:
+        response = httpx.get(url, timeout=config["timeout_seconds"],
+                             follow_redirects=True, headers=headers)
+        response.raise_for_status()
+        if "html" not in response.headers.get("content-type", "html"):
+            return ""
+        return extract_page_text(response.text)[: config["max_page_chars"]]
+
+    texts: dict[str, str] = {}
+    urls = [item["url"] for item in results if item["url"]]
+    with ThreadPoolExecutor(max_workers=min(5, len(urls) or 1)) as pool:
+        futures = {pool.submit(fetch, url): url for url in urls}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                texts[url] = future.result()
+            except httpx.HTTPError as exc:
+                logger.info("Skipping web result %s: %s", url, exc)
+    return texts
+
+
+def web_search_context(query: str) -> str:
+    """Search the web and build a context block for prompt injection.
+
+    With fetch_pages on, the top result pages are downloaded and their chunks
+    embed-ranked against the query (the RAG pipeline); when pages or the
+    embedding model are unavailable, the result snippets are used instead.
+    """
+    results = run_web_search(query)
+    if not results:
+        return ""
+    # The snippets always go in: for weather/news-style queries they often
+    # carry the direct answer, while the pages behind them are JS shells
+    # whose extracted text contains nothing useful.
+    snippets = "Search results:\n\n" + "\n\n".join(
+        f"[{index}] {item['title']}\n{item['url']}\n{item['snippet']}"
+        for index, item in enumerate(results, 1)
+    )
+    if not CONFIG["web_search"]["fetch_pages"]:
+        return snippets
+    page_texts = fetch_page_texts(results)
+    rag = CONFIG["rag"]
+    pool: list[tuple[dict[str, str], str]] = []
+    for item in results:
+        text = page_texts.get(item["url"], "")
+        for chunk in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"]):
+            pool.append((item, chunk))
+    if not pool:
+        return snippets
+    chunk_embeddings = embed_texts([f"search_document: {chunk}" for _, chunk in pool])
+    query_embedding = embed_texts([f"search_query: {query}"]) if chunk_embeddings else None
+    if not chunk_embeddings or not query_embedding:
+        return snippets
+    q = query_embedding[0]
+    qnorm = math.sqrt(_dot(q, q)) or 1.0
+    scored = sorted(
+        zip(pool, chunk_embeddings),
+        key=lambda entry: _dot(q, entry[1]) / ((math.sqrt(_dot(entry[1], entry[1])) or 1.0) * qnorm),
+        reverse=True,
+    )
+    top = scored[: CONFIG["web_search"]["top_k"]]
+    excerpts = "\n\n".join(
+        f"[{item['title']}]({item['url']})\n{chunk}" for (item, chunk), _ in top)
+    return snippets + "\n\nRelevant excerpts from the result pages:\n\n" + excerpts
+
+
 def apply_web_search(messages: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     """Prepend web search results for `query` to the final user turn.
 
-    `query` is the original user question, passed explicitly because RAG may
-    already have prepended document context to the message by this point.
+    `query` is passed explicitly because RAG may already have prepended
+    document context to the message by this point.
     """
     # Search engines cap query length; the first sentences carry the intent.
-    results = run_web_search(query[:400])
-    if not results:
+    context = web_search_context(query[:400])
+    if not context:
         return messages
-    blocks = [
-        f"[{index}] {item['title']}\n{item['url']}\n{item['snippet']}"
-        for index, item in enumerate(results, 1)
-    ]
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     preamble = (
         f"Web search results retrieved {today} (UTC). Use them to answer when "
         "relevant and cite sources inline as markdown links.\n\n"
-        + "\n\n".join(blocks) + "\n\n"
+        + context + "\n\n"
     )
     return prepend_to_last_user_turn(messages, preamble)
 
@@ -1505,12 +1686,25 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
         outgoing = [message.model_dump() for message in request.messages]
         # Capture the user's question before RAG prepends document context to it.
         query = last_user_query(outgoing)
+        web_config = CONFIG["web_search"]
+        search_query = None
+        if request.web_search and web_config["enabled"] and query:
+            search_query = query
+            if web_config["rewrite_query"]:
+                yield f"data: {json.dumps({'status': '🌐 Preparing web search…'})}\n\n"
+                # Rewrite from the pre-RAG messages so retrieved document
+                # chunks don't leak into the search query.
+                search_query = rewrite_search_query(request.model, outgoing, query)
+                if search_query != query:
+                    logger.info("Search query rewritten: %r", search_query)
         if request.doc_ids:
             outgoing = apply_rag(outgoing, request.doc_ids)
-        if request.web_search and CONFIG["web_search"]["enabled"] and query:
-            yield f"data: {json.dumps({'status': '🌐 Searching the web…'})}\n\n"
+        if search_query:
+            searching = ("🌐 Searching the web & reading the top results…"
+                         if web_config["fetch_pages"] else "🌐 Searching the web…")
+            yield f"data: {json.dumps({'status': searching})}\n\n"
             try:
-                outgoing = apply_web_search(outgoing, query)
+                outgoing = apply_web_search(outgoing, search_query)
             except WebSearchError as exc:
                 # Degrade gracefully: surface the failure as a toast and let
                 # the model answer from its own knowledge.
