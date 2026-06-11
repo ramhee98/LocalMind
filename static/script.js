@@ -2005,7 +2005,9 @@
       if (thinkingDetails) {
         // Relabel once reasoning is done, but leave the open/closed state alone
         // so we don't override whatever the user toggled.
-        thinkingDetails.querySelector("summary").textContent = "💭 Thoughts";
+        const tokenCount = estimateTokens(reasoningContent);
+        thinkingDetails.querySelector("summary").textContent =
+          `💭 Thoughts (≈${formatTokens(tokenCount)} tokens)`;
       }
     }
 
