@@ -45,6 +45,9 @@
   const conversationList = document.getElementById("conversation-list");
   const newChatButton = document.getElementById("new-chat");
   const conversationSearch = document.getElementById("conversation-search");
+  const contextMeter = document.getElementById("context-meter");
+  const contextMeterFill = document.getElementById("context-meter-fill");
+  const contextMeterText = document.getElementById("context-meter-text");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -64,6 +67,10 @@
   let docIds = new Set();
   /** Model keys / instance ids with an in-flight load or unload request. */
   const busyModels = new Set();
+  /** Loaded-instance id -> context window in tokens, for the context meter. */
+  let contextWindows = {};
+  /** RAG retrieval parameters from the server, for token estimation. */
+  let ragEstimate = { top_k: 0, chunk_chars: 0 };
 
   // ---------- Error banner ----------
 
@@ -121,6 +128,9 @@
         }
         statusRefreshSeconds = management.status_refresh_seconds || 10;
       }
+      if (data.rag?.top_k) {
+        ragEstimate = { top_k: data.rag.top_k, chunk_chars: data.rag.chunk_chars || 0 };
+      }
       const defaultSize = data.image_generation?.default_size;
       if (defaultSize) {
         if (![...imageSizeSelect.options].some((o) => o.value === defaultSize)) {
@@ -131,6 +141,7 @@
         }
         imageSizeSelect.value = defaultSize;
       }
+      updateContextMeter();
     } catch {
       /* Non-fatal: the UI falls back to its hardcoded defaults. */
     }
@@ -167,6 +178,7 @@
       }
       modelSelect.disabled = false;
       updateSendState();
+      refreshContextWindows();
     } catch (error) {
       modelSelect.innerHTML = "<option value=''>No models available</option>";
       if (!quiet) showError(error.message || "Could not reach the backend.");
@@ -400,6 +412,85 @@
 
   unloadAllButton.addEventListener("click", unloadAll);
 
+  // ---------- Context-window meter ----------
+
+  // Rough heuristic: ~4 characters per token, plus a flat cost per image.
+  const CHARS_PER_TOKEN = 4;
+  const IMAGE_TOKEN_ESTIMATE = 800;
+
+  function estimateTokens(text) {
+    return Math.ceil((text || "").length / CHARS_PER_TOKEN);
+  }
+
+  function estimateMessageTokens(message) {
+    let tokens = 4; // per-message formatting overhead
+    const content = message.content;
+    if (typeof content === "string") {
+      tokens += estimateTokens(content);
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part?.type === "text") tokens += estimateTokens(part.text);
+        else if (part?.type === "image_url") tokens += IMAGE_TOKEN_ESTIMATE;
+      }
+    }
+    return tokens;
+  }
+
+  function formatTokens(tokens) {
+    return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
+  }
+
+  /** Map loaded instances to their context windows (instance override or model max). */
+  async function refreshContextWindows() {
+    try {
+      const response = await fetch("/api/models/manage");
+      if (!response.ok) return;
+      const { models } = await response.json();
+      contextWindows = {};
+      for (const model of models || []) {
+        for (const instance of model.loaded_instances || []) {
+          if (instance.id) {
+            contextWindows[instance.id] =
+              instance.context_length || model.max_context_length || 0;
+          }
+        }
+      }
+    } catch {
+      /* Native API unavailable: the meter simply stays hidden. */
+    }
+    updateContextMeter();
+  }
+
+  function updateContextMeter() {
+    const limit = contextWindows[modelSelect.value];
+    if (!limit) {
+      contextMeter.classList.add("hidden");
+      return;
+    }
+    let used = estimateTokens(systemPrompt);
+    for (const message of messages) used += estimateMessageTokens(message);
+    used += estimateTokens(messageInput.value);
+    for (const doc of attachments) {
+      if (doc.uploading) continue;
+      if (doc.kind === "image") used += IMAGE_TOKEN_ESTIMATE;
+      else if (!doc.rag) used += estimateTokens(doc.text);
+    }
+    if (docIds.size && ragEstimate.top_k) {
+      used += Math.ceil((ragEstimate.top_k * ragEstimate.chunk_chars) / CHARS_PER_TOKEN);
+    }
+    const percent = Math.min(100, Math.round((used / limit) * 100));
+    contextMeterFill.style.width = `${percent}%`;
+    contextMeterFill.classList.toggle("warn", percent >= 80 && percent < 95);
+    contextMeterFill.classList.toggle("danger", percent >= 95);
+    contextMeterText.textContent = `≈${formatTokens(used)} / ${formatTokens(limit)}`;
+    contextMeter.title =
+      `Estimated prompt size: ~${used.toLocaleString()} of ` +
+      `${limit.toLocaleString()} tokens (${percent}%).\n` +
+      "Covers the system prompt, history, attachments, and your draft — " +
+      "a character-based estimate, not an exact token count.";
+    contextMeter.classList.remove("hidden");
+  }
+
   // ---------- Chat rendering ----------
 
   function appendMessage(role, content) {
@@ -419,6 +510,7 @@
       (!imageMode && !modelSelect.value);
     sendButton.textContent = imageMode ? "Generate" : "Send";
     updateEnhanceLabel();
+    updateContextMeter();
   }
 
   // ---------- Document attachments ----------
@@ -712,6 +804,7 @@
     renderAttachments();
     clearChatWindow();
     highlightActiveConversation();
+    updateContextMeter();
   }
 
   clearChatButton.addEventListener("click", startNewChat);
@@ -1124,6 +1217,7 @@
       renderAttachments();
       renderConversationHistory();
       highlightActiveConversation();
+      updateContextMeter();
       closeSidebarOnMobile();
     } catch (error) {
       toast(error.message || "Could not load the conversation.", "error", 6000);

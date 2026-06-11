@@ -236,6 +236,12 @@ def get_config() -> dict[str, Any]:
         "model_management": CONFIG["model_management"],
         "image_generation": {"default_size": CONFIG["image_generation"]["default_size"]},
         "documents": CONFIG["documents"],
+        # Lets the UI estimate how many tokens retrieved chunks will add.
+        "rag": {
+            "enabled": CONFIG["rag"]["enabled"],
+            "top_k": CONFIG["rag"]["top_k"],
+            "chunk_chars": CONFIG["rag"]["chunk_chars"],
+        },
         "base_url": CONFIG["lm_studio_base_url"],
     }
 

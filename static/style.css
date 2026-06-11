@@ -808,6 +808,43 @@ input[type="number"] {
   cursor: not-allowed;
 }
 
+/* ---------- Context-window meter ---------- */
+
+.context-meter {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.context-meter-bar {
+  width: 90px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+#context-meter-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.2s ease, background 0.2s ease;
+}
+
+#context-meter-fill.warn { background: #d9b86c; }
+#context-meter-fill.danger { background: var(--error); }
+
+#context-meter-text {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .enhance-toggle {
   display: flex;
   align-items: center;
