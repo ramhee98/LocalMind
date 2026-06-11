@@ -1953,7 +1953,8 @@
       if (!thinkingDetails) {
         thinkingDetails = document.createElement("details");
         thinkingDetails.className = "thinking";
-        thinkingDetails.open = true;
+        // Stays collapsed by default; the user can expand it to read the
+        // model's reasoning rather than having it pop open on every reply.
         const summary = document.createElement("summary");
         summary.textContent = "💭 Thinking…";
         thinkingBody = document.createElement("div");
@@ -1966,8 +1967,9 @@
     }
 
     function finishThinking() {
-      if (thinkingDetails && thinkingDetails.open) {
-        thinkingDetails.open = false;
+      if (thinkingDetails) {
+        // Relabel once reasoning is done, but leave the open/closed state alone
+        // so we don't override whatever the user toggled.
         thinkingDetails.querySelector("summary").textContent = "💭 Thoughts";
       }
     }
