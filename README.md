@@ -7,6 +7,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Dynamic model selection** — the dropdown is populated with the models currently loaded in LM Studio.
 - **Real-time streaming** — responses render token-by-token via Server-Sent Events.
 - **Stop generation** — the Send button turns into ⏹ Stop while a reply streams; stopping keeps the partial answer in the conversation and aborts the upstream LM Studio request so the model stops burning tokens.
+- **Markdown rendering** — assistant replies render as sanitized Markdown (GFM) live while streaming: headings, lists, tables, blockquotes, links, and fenced code blocks with a hover copy button. Uses vendored [marked](https://github.com/markedjs/marked) + [DOMPurify](https://github.com/cure53/DOMPurify), so it works fully offline.
 - **Parameter controls** — adjust `temperature` and `max_tokens` from a settings panel before sending.
 - **Model management** — load and unload models straight from the UI (📦 panel), with:
   - **idle TTL (auto-unload)** — automatically unload a model after it has been idle for a configurable number of seconds,
@@ -37,7 +38,8 @@ LocalMind/
 ├── static/
 │   ├── index.html          # Chat UI
 │   ├── style.css           # Styling (dark, responsive)
-│   └── script.js           # Frontend logic (models, settings, SSE streaming)
+│   ├── script.js           # Frontend logic (models, settings, SSE streaming)
+│   └── vendor/             # Vendored libraries (marked, DOMPurify)
 ├── .gitignore
 ├── LICENSE
 └── README.md

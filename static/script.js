@@ -493,6 +493,72 @@
     contextMeter.classList.remove("hidden");
   }
 
+  // ---------- Markdown rendering ----------
+
+  // Vendored libraries; if either failed to load, fall back to plain text.
+  const markdownReady =
+    typeof window.marked !== "undefined" && typeof window.DOMPurify !== "undefined";
+  if (markdownReady) {
+    marked.use({ gfm: true, breaks: true });
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
+    // Plain-http LAN pages have no clipboard API: fall back to execCommand.
+    const scratch = document.createElement("textarea");
+    scratch.value = text;
+    scratch.style.position = "fixed";
+    scratch.style.opacity = "0";
+    document.body.appendChild(scratch);
+    scratch.select();
+    try {
+      return document.execCommand("copy")
+        ? Promise.resolve()
+        : Promise.reject(new Error("copy rejected"));
+    } finally {
+      scratch.remove();
+    }
+  }
+
+  function addCodeCopyButtons(target) {
+    for (const pre of target.querySelectorAll("pre")) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "code-copy";
+      button.textContent = "⧉ Copy";
+      button.addEventListener("click", async () => {
+        const code = pre.querySelector("code");
+        try {
+          await copyText((code ?? pre).innerText.replace(/\n$/, ""));
+          button.textContent = "✓ Copied";
+        } catch {
+          button.textContent = "Copy failed";
+        }
+        setTimeout(() => { button.textContent = "⧉ Copy"; }, 1500);
+      });
+      pre.appendChild(button);
+    }
+  }
+
+  /**
+   * Render assistant markdown into `target`, sanitized. Model output is
+   * untrusted input, so everything goes through DOMPurify. Copy buttons are
+   * skipped during streaming (the subtree is replaced on every chunk).
+   */
+  function renderMarkdown(target, text, { withCopyButtons = true } = {}) {
+    if (!markdownReady) {
+      target.textContent = text;
+      return;
+    }
+    target.classList.add("md");
+    target.innerHTML = DOMPurify.sanitize(marked.parse(text));
+    for (const link of target.querySelectorAll("a[href]")) {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    }
+    if (withCopyButtons) addCodeCopyButtons(target);
+  }
+
   // ---------- Chat rendering ----------
 
   function appendMessage(role, content) {
@@ -1076,7 +1142,8 @@
         }
         attachMessageActions(bubble, "user", index);
       } else if (message.role === "assistant") {
-        const bubble = appendMessage("assistant", extractMessageText(message.content));
+        const bubble = appendMessage("assistant", "");
+        renderMarkdown(bubble, extractMessageText(message.content));
         attachMessageActions(bubble, "assistant", index);
       }
     });
@@ -1470,19 +1537,22 @@
             if (!assistantContent) finishThinking();
             ensureContentSpan();
             assistantContent += parsed.content;
-            contentSpan.textContent = assistantContent;
+            renderMarkdown(contentSpan, assistantContent, { withCopyButtons: false });
             chatWindow.scrollTop = chatWindow.scrollHeight;
           }
         }
       }
 
       finishThinking();
+      // Final render adds the code-block copy buttons.
+      if (assistantContent && contentSpan) renderMarkdown(contentSpan, assistantContent);
       // Only the final answer (not the thinking) goes back into the history.
       messages.push({ role: "assistant", content: assistantContent });
       attachMessageActions(assistantBubble, "assistant", messages.length - 1);
     } catch (error) {
       if (assistantContent) {
         // Keep the partial answer in history so the conversation stays coherent.
+        if (contentSpan) renderMarkdown(contentSpan, assistantContent);
         messages.push({ role: "assistant", content: assistantContent });
         attachMessageActions(assistantBubble, "assistant", messages.length - 1);
       } else {
