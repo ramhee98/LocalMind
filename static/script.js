@@ -553,9 +553,12 @@
       modelsList.appendChild(row);
     }
 
+    // LM Studio doesn't report a loaded instance's resident memory, only the
+    // model's on-disk size — so label this as a disk-footprint estimate rather
+    // than implying it's the exact RAM/VRAM in use.
     modelsSummary.textContent =
       `${loadedCount} of ${models.length} models loaded` +
-      (loadedBytes ? ` · ~${formatBytes(loadedBytes)} in memory` : "");
+      (loadedBytes ? ` · ~${formatBytes(loadedBytes)} on disk` : "");
   }
 
   async function refreshManagedModels({ quiet = false } = {}) {
