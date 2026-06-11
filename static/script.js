@@ -746,9 +746,15 @@
 
   /** Estimated tokens in the current prompt: system, history, draft, attachments, RAG. */
   function estimateUsedTokens() {
-    let used = estimateTokens(systemPrompt);
+    // The system prompt and the in-progress draft each become full messages in
+    // the API call, so they need the same per-message overhead (+4 tokens) that
+    // estimateMessageTokens applies to the history entries.
+    let used = systemPrompt
+      ? estimateMessageTokens({ role: "system", content: systemPrompt })
+      : 0;
     for (const message of messages) used += estimateMessageTokens(message);
-    used += estimateTokens(messageInput.value);
+    if (messageInput.value)
+      used += estimateMessageTokens({ role: "user", content: messageInput.value });
     for (const doc of attachments) {
       if (doc.uploading) continue;
       if (doc.kind === "image") used += IMAGE_TOKEN_ESTIMATE;
