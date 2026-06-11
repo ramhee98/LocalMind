@@ -1057,10 +1057,14 @@ def manage_models() -> JSONResponse:
             "quantization": (model.get("quantization") or {}).get("name"),
             "size_bytes": model.get("size_bytes"),
             "max_context_length": model.get("max_context_length"),
+            "capabilities": model.get("capabilities") or {},
             "loaded_instances": [
                 {
                     "id": instance.get("id"),
                     "context_length": (instance.get("config") or {}).get("context_length"),
+                    # LM Studio reports the live countdown to auto-eviction; absent
+                    # when the instance was loaded without a TTL.
+                    "remaining_ttl_seconds": instance.get("remaining_ttl_seconds"),
                 }
                 for instance in model.get("loaded_instances", [])
             ],

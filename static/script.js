@@ -423,6 +423,17 @@
     return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens);
   }
 
+  /** Seconds -> "m:ss" (or "h:mm:ss"), for the live TTL countdown. */
+  function formatDuration(seconds) {
+    if (seconds === null || seconds === undefined) return "";
+    const total = Math.max(0, Math.round(seconds));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  }
+
   function loadOptions() {
     const options = {};
     if (ttlEnabledInput.checked) {
@@ -507,8 +518,14 @@
           const line = document.createElement("div");
           line.className = "model-instance";
           const label = document.createElement("span");
-          label.textContent = instance.context_length
-            ? `${instance.id} — ctx ${formatContext(instance.context_length)}`
+          const details = [
+            instance.context_length ? `ctx ${formatContext(instance.context_length)}` : "",
+            instance.remaining_ttl_seconds != null
+              ? `ttl ${formatDuration(instance.remaining_ttl_seconds)}`
+              : "no ttl",
+          ].filter(Boolean);
+          label.textContent = details.length
+            ? `${instance.id} — ${details.join(" · ")}`
             : instance.id;
           const unloadButton = document.createElement("button");
           unloadButton.type = "button";
