@@ -19,11 +19,12 @@ Document upload (text is extracted server-side and injected into the chat):
   * POST /api/upload             -> extract text from an uploaded PDF
 
 Conversation persistence (SQLite, server-side):
-  * GET    /api/conversations      -> list conversations (newest first)
-  * POST   /api/conversations      -> create an empty conversation
-  * GET    /api/conversations/{id} -> full message history
-  * PUT    /api/conversations/{id} -> save messages and/or rename
-  * DELETE /api/conversations/{id} -> delete
+  * GET    /api/conversations        -> list conversations (newest first)
+  * POST   /api/conversations        -> create an empty conversation
+  * GET    /api/conversations/search -> full-text search across all conversations
+  * GET    /api/conversations/{id}   -> full message history
+  * PUT    /api/conversations/{id}   -> save messages and/or rename
+  * DELETE /api/conversations/{id}   -> delete
 """
 
 from __future__ import annotations
@@ -248,7 +249,37 @@ def db_connect() -> sqlite3.Connection:
     return connection
 
 
+def message_text(message: dict[str, Any]) -> str:
+    """Best-effort plain text of a stored message (display field, text, or part)."""
+    display = message.get("display")
+    if isinstance(display, str) and display.strip():
+        return display
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                return str(part.get("text") or "")
+    return ""
+
+
+def searchable_body(messages: list[dict[str, Any]]) -> str:
+    """Plain-text body of a conversation for the search index.
+
+    Uses the display text of each message, so inlined document dumps and
+    base64 image payloads never pollute search results.
+    """
+    return "\n".join(filter(None, (message_text(message) for message in messages)))
+
+
+# False when this Python's SQLite was built without FTS5; search then falls
+# back to a full scan, which is fine at personal-use scale.
+FTS_AVAILABLE = True
+
+
 def init_db() -> None:
+    global FTS_AVAILABLE
     with closing(db_connect()) as connection, connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute(
@@ -259,9 +290,44 @@ def init_db() -> None:
                    updated_at TEXT NOT NULL,
                    messages_json TEXT NOT NULL DEFAULT '[]'
                )""")
+        try:
+            connection.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS conversation_fts
+                   USING fts5(conversation_id UNINDEXED, title, body)""")
+        except sqlite3.OperationalError:
+            FTS_AVAILABLE = False
+            logger.warning("SQLite FTS5 is unavailable — conversation search "
+                           "will scan conversations instead.")
+            return
+        # Index conversations that predate the search feature.
+        missing = connection.execute(
+            "SELECT id, title, messages_json FROM conversations WHERE id NOT IN "
+            "(SELECT conversation_id FROM conversation_fts)").fetchall()
+        for row in missing:
+            try:
+                messages = json.loads(row["messages_json"])
+            except json.JSONDecodeError:
+                messages = []
+            connection.execute(
+                "INSERT INTO conversation_fts (conversation_id, title, body) "
+                "VALUES (?, ?, ?)",
+                (row["id"], row["title"], searchable_body(messages)))
+        if missing:
+            logger.info("Backfilled %s conversation(s) into the search index.", len(missing))
 
 
 init_db()
+
+
+def update_search_index(connection: sqlite3.Connection, conversation_id: str,
+                        title: str, messages: list[dict[str, Any]]) -> None:
+    if not FTS_AVAILABLE:
+        return
+    connection.execute(
+        "DELETE FROM conversation_fts WHERE conversation_id = ?", (conversation_id,))
+    connection.execute(
+        "INSERT INTO conversation_fts (conversation_id, title, body) VALUES (?, ?, ?)",
+        (conversation_id, title, searchable_body(messages)))
 
 
 # Bound the persisted payload so an unauthenticated PUT can't OOM the process
@@ -279,21 +345,6 @@ class ConversationUpdate(BaseModel):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def message_text(message: dict[str, Any]) -> str:
-    """Best-effort plain text of a stored message (display field, text, or part)."""
-    display = message.get("display")
-    if isinstance(display, str) and display.strip():
-        return display
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                return str(part.get("text") or "")
-    return ""
 
 
 def derive_title(messages: list[dict[str, Any]]) -> Optional[str]:
@@ -328,6 +379,70 @@ def create_conversation() -> dict[str, Any]:
     return {"id": conversation_id, "title": "New chat"}
 
 
+def fts_match_expression(query: str) -> str:
+    """Turn free-form user input into a safe FTS5 prefix query.
+
+    Every term is quoted (so FTS5 operators and punctuation are literal) and
+    given a trailing *, which makes search-as-you-type match partial words.
+    """
+    terms = (term.replace('"', '""') for term in query.split())
+    return " ".join(f'"{term}"*' for term in terms)
+
+
+def make_snippet(body: str, query: str, radius: int = 60) -> str:
+    """A short context window around the first matched term, in plain text."""
+    text = " ".join(body.split())
+    lowered = text.lower()
+    positions = [position for position in
+                 (lowered.find(term.lower()) for term in query.split())
+                 if position != -1]
+    if not positions:
+        return text[: radius * 2] + ("…" if len(text) > radius * 2 else "")
+    start = max(0, min(positions) - radius)
+    end = min(len(text), min(positions) + radius)
+    return (("…" if start > 0 else "") + text[start:end]
+            + ("…" if end < len(text) else ""))
+
+
+@app.get("/api/conversations/search")
+def search_conversations(q: str = "") -> dict[str, Any]:
+    """Full-text search over titles and message text of all conversations."""
+    query = " ".join(q.split())
+    if not query:
+        return {"results": []}
+    with closing(db_connect()) as connection:
+        if FTS_AVAILABLE:
+            rows = connection.execute(
+                "SELECT c.id, c.title, c.updated_at, f.body FROM conversation_fts f "
+                "JOIN conversations c ON c.id = f.conversation_id "
+                "WHERE conversation_fts MATCH ? ORDER BY rank LIMIT 30",
+                (fts_match_expression(query),)).fetchall()
+            matches = [(row["id"], row["title"], row["updated_at"], row["body"])
+                       for row in rows]
+        else:
+            # FTS5 not compiled in: scan and substring-match every conversation.
+            matches = []
+            terms = [term.lower() for term in query.split()]
+            for row in connection.execute(
+                    "SELECT id, title, updated_at, messages_json FROM conversations "
+                    "ORDER BY updated_at DESC").fetchall():
+                try:
+                    messages = json.loads(row["messages_json"])
+                except json.JSONDecodeError:
+                    messages = []
+                body = searchable_body(messages)
+                haystack = f"{row['title']}\n{body}".lower()
+                if all(term in haystack for term in terms):
+                    matches.append((row["id"], row["title"], row["updated_at"], body))
+                if len(matches) >= 30:
+                    break
+    return {"results": [
+        {"id": conversation_id, "title": title, "updated_at": updated_at,
+         "snippet": make_snippet(body, query)}
+        for conversation_id, title, updated_at, body in matches
+    ]}
+
+
 @app.get("/api/conversations/{conversation_id}")
 def get_conversation(conversation_id: str) -> JSONResponse:
     with closing(db_connect()) as connection:
@@ -358,7 +473,8 @@ async def update_conversation(conversation_id: str, http_request: Request) -> JS
         return JSONResponse(status_code=422, content={"error": str(exc)})
     with closing(db_connect()) as connection, connection:
         row = connection.execute(
-            "SELECT title FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+            "SELECT title, messages_json FROM conversations WHERE id = ?",
+            (conversation_id,)).fetchone()
         if row is None:
             return JSONResponse(status_code=404, content={"error": "Conversation not found."})
         title = request.title or row["title"]
@@ -370,10 +486,16 @@ async def update_conversation(conversation_id: str, http_request: Request) -> JS
                 "UPDATE conversations SET messages_json = ?, title = ?, updated_at = ? "
                 "WHERE id = ?",
                 (json.dumps(request.messages), title, utc_now(), conversation_id))
+            update_search_index(connection, conversation_id, title, request.messages)
         else:
             connection.execute(
                 "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
                 (title, utc_now(), conversation_id))
+            try:
+                stored = json.loads(row["messages_json"])
+            except json.JSONDecodeError:
+                stored = []
+            update_search_index(connection, conversation_id, title, stored)
     return JSONResponse(content={"id": conversation_id, "title": title})
 
 
@@ -382,6 +504,10 @@ def delete_conversation(conversation_id: str) -> JSONResponse:
     with closing(db_connect()) as connection, connection:
         deleted = connection.execute(
             "DELETE FROM conversations WHERE id = ?", (conversation_id,)).rowcount
+        if FTS_AVAILABLE:
+            connection.execute(
+                "DELETE FROM conversation_fts WHERE conversation_id = ?",
+                (conversation_id,))
     if not deleted:
         return JSONResponse(status_code=404, content={"error": "Conversation not found."})
     logger.info("Deleted conversation %s", conversation_id)

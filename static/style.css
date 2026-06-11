@@ -79,6 +79,25 @@ body {
 
 .new-chat-button:hover { filter: brightness(1.12); }
 
+.conversation-search {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  background: var(--surface-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.conversation-search::placeholder { color: var(--text-muted); }
+
+.conversation-search:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .conversation-list {
   list-style: none;
   margin: 0;
@@ -143,6 +162,27 @@ body {
 .conversation-item:hover .conversation-delete { visibility: visible; }
 
 .conversation-delete:hover { color: var(--error); }
+
+.conversation-item.search-result {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+}
+
+.conversation-snippet {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.conversation-empty {
+  padding: 10px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
 
 .sidebar-hint {
   margin: 0;

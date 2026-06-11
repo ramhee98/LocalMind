@@ -44,6 +44,7 @@
   const sidebarBackdrop = document.getElementById("sidebar-backdrop");
   const conversationList = document.getElementById("conversation-list");
   const newChatButton = document.getElementById("new-chat");
+  const conversationSearch = document.getElementById("conversation-search");
 
   /** Conversation history sent to the backend on every request. */
   let messages = [];
@@ -748,6 +749,12 @@
   });
 
   async function loadConversations() {
+    // While a search is active, refreshes re-run the search instead of
+    // replacing the filtered list with all conversations.
+    if (conversationSearch.value.trim()) {
+      runConversationSearch();
+      return;
+    }
     try {
       const response = await fetch("/api/conversations");
       if (!response.ok) return;
@@ -757,6 +764,75 @@
       /* Non-fatal: the sidebar just stays empty. */
     }
   }
+
+  // ---------- Conversation search ----------
+
+  let searchDebounceTimer = null;
+
+  async function runConversationSearch() {
+    const query = conversationSearch.value.trim();
+    if (!query) {
+      loadConversations();
+      return;
+    }
+    try {
+      const response = await fetch(
+        `/api/conversations/search?q=${encodeURIComponent(query)}`);
+      if (!response.ok) return;
+      const { results } = await response.json();
+      // The user may have kept typing while this request was in flight.
+      if (conversationSearch.value.trim() !== query) return;
+      renderSearchResults(results);
+    } catch {
+      /* Non-fatal: the previous list stays visible. */
+    }
+  }
+
+  function renderSearchResults(results) {
+    conversationList.innerHTML = "";
+    if (!results.length) {
+      const empty = document.createElement("li");
+      empty.className = "conversation-empty";
+      empty.textContent = "No matching conversations.";
+      conversationList.appendChild(empty);
+      return;
+    }
+    for (const result of results) {
+      const item = document.createElement("li");
+      item.className = "conversation-item search-result";
+      item.dataset.id = result.id;
+
+      const title = document.createElement("span");
+      title.className = "conversation-title";
+      title.textContent = result.title;
+      title.title = result.title;
+      item.appendChild(title);
+
+      if (result.snippet) {
+        const snippet = document.createElement("span");
+        snippet.className = "conversation-snippet";
+        snippet.textContent = result.snippet;
+        item.appendChild(snippet);
+      }
+
+      item.addEventListener("click", () => openConversation(result.id));
+      conversationList.appendChild(item);
+    }
+    highlightActiveConversation();
+  }
+
+  conversationSearch.addEventListener("input", () => {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(runConversationSearch, 250);
+  });
+
+  conversationSearch.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && conversationSearch.value) {
+      event.stopPropagation();
+      conversationSearch.value = "";
+      runConversationSearch();
+    }
+  });
 
   function renderConversationList(conversations) {
     conversationList.innerHTML = "";

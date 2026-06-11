@@ -19,6 +19,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Image attachments & pasted screenshots** — attach images via the picker, drag & drop, or simply paste a screenshot (Cmd+V); they are sent to vision-capable models (like Gemma) as multimodal input.
 - **Thinking control** — a settings option to turn model reasoning off/low/high per conversation; when a model thinks, the thought stream renders live in a collapsible 💭 block that folds away once the answer starts.
 - **Saved conversations** — every chat is persisted server-side (SQLite) and listed in a sidebar; reload-safe, multi-device over the LAN, with rename and delete. The user turn is saved before streaming begins, so nothing is lost mid-generation.
+- **Conversation search** — a search box in the sidebar runs full-text search (SQLite FTS5, search-as-you-type) over the titles and message text of all saved conversations and shows matching snippets; press Escape to clear.
 - **Document retrieval (RAG)** — long uploads are chunked, embedded with a local embedding model, and queried by relevance per question (only the top matches enter the prompt) — so you can chat about a big PDF without blowing the context window. Small docs are still inlined.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
