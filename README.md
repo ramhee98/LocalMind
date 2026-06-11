@@ -9,6 +9,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Stop generation** — the Send button turns into ⏹ Stop while a reply streams; stopping keeps the partial answer in the conversation and aborts the upstream LM Studio request so the model stops burning tokens.
 - **Markdown rendering** — assistant replies render as sanitized Markdown (GFM) live while streaming: headings, lists, tables, blockquotes, links, and fenced code blocks with a hover copy button. Uses vendored [marked](https://github.com/markedjs/marked) + [DOMPurify](https://github.com/cure53/DOMPurify), so it works fully offline.
 - **Parameter controls** — adjust `temperature` and `max_tokens` from a settings panel before sending.
+- **System prompt presets** — save, name, and switch between reusable system prompts (e.g. *Code reviewer*, *Translator*, *Socratic tutor*) from the ⚙ settings panel. Presets are persisted server-side (SQLite); edit the prompt inline for a one-off, or save it back to a preset. The last-used preset is remembered across reloads.
 - **Model management** — load and unload models straight from the UI (📦 panel), with:
   - **idle TTL (auto-unload)** — automatically unload a model after it has been idle for a configurable number of seconds,
   - **context length override** — load a model with a custom context window,
@@ -262,6 +263,10 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | `GET` | `/api/conversations/{id}` | Full message history of a conversation |
 | `PUT` | `/api/conversations/{id}` | Save messages and/or rename: `{"messages"?, "title"?}` |
 | `DELETE` | `/api/conversations/{id}` | Delete a conversation |
+| `GET` | `/api/system-prompts` | List saved system prompt presets (newest first) |
+| `POST` | `/api/system-prompts` | Create a preset: `{"name", "content"}` |
+| `PUT` | `/api/system-prompts/{id}` | Rename and/or edit a preset: `{"name"?, "content"?}` |
+| `DELETE` | `/api/system-prompts/{id}` | Delete a preset |
 | `GET` | `/api/models/manage` | All downloaded models with load state and details |
 | `POST` | `/api/models/load` | Load a model: `{"model", "ttl_seconds"?, "context_length"?}` |
 | `POST` | `/api/models/unload` | Unload one instance: `{"instance_id"}` |

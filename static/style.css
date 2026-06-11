@@ -392,6 +392,49 @@ input[type="number"] {
   width: 130px;
 }
 
+/* System prompt presets occupy the full width of the settings panel. */
+.setting-wide {
+  flex-basis: 100%;
+  min-width: 100%;
+}
+
+.preset-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.preset-row #preset-select {
+  flex: 1;
+  min-width: 180px;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+}
+
+#system-prompt {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  resize: vertical;
+  min-height: 64px;
+}
+
+.preset-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.preset-status {
+  flex: 1;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.preset-status.dirty { color: var(--accent); }
+
 /* ---------- Model management panel ---------- */
 
 .models-panel {

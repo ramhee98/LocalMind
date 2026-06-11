@@ -62,6 +62,29 @@
     </div>
 
     <aside id="settings-panel" class="settings-panel hidden" aria-label="Generation settings">
+      <h2>System Prompt</h2>
+      <div class="setting setting-wide">
+        <label for="preset-select">Preset</label>
+        <div class="preset-row">
+          <select id="preset-select" aria-label="System prompt preset">
+            <option value="">Loading…</option>
+          </select>
+          <button id="preset-new" class="small-button" type="button"
+                  title="Save the current prompt as a new preset">＋ New</button>
+          <button id="preset-rename" class="small-button" type="button"
+                  title="Rename the selected preset">Rename</button>
+          <button id="preset-delete" class="small-button danger" type="button"
+                  title="Delete the selected preset">Delete</button>
+        </div>
+        <textarea id="system-prompt" rows="4"
+                  placeholder="System prompt sent at the start of every conversation…"
+                  aria-label="System prompt content"></textarea>
+        <div class="preset-actions">
+          <span id="preset-status" class="preset-status"></span>
+          <button id="preset-save" class="small-button primary" type="button"
+                  title="Save edits back to the selected preset" disabled>Save</button>
+        </div>
+      </div>
       <h2>Generation Settings</h2>
       <div class="setting">
         <label for="temperature">

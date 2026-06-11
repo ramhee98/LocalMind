@@ -15,6 +15,13 @@
   const temperatureInput = document.getElementById("temperature");
   const temperatureValue = document.getElementById("temperature-value");
   const maxTokensInput = document.getElementById("max-tokens");
+  const presetSelect = document.getElementById("preset-select");
+  const presetNewButton = document.getElementById("preset-new");
+  const presetRenameButton = document.getElementById("preset-rename");
+  const presetDeleteButton = document.getElementById("preset-delete");
+  const presetSaveButton = document.getElementById("preset-save");
+  const presetStatus = document.getElementById("preset-status");
+  const systemPromptInput = document.getElementById("system-prompt");
   const chatWindow = document.getElementById("chat-window");
   const emptyState = document.getElementById("empty-state");
   const messageInput = document.getElementById("message-input");
@@ -55,6 +62,12 @@
   /** Conversation history sent to the backend on every request. */
   let messages = [];
   let systemPrompt = "";
+  /** Saved system prompt presets, newest first; mirrors the server table. */
+  let presets = [];
+  /** Id of the selected preset, or "" when the prompt is an unsaved edit. */
+  let activePresetId = "";
+  /** localStorage key remembering the last-selected preset across reloads. */
+  const ACTIVE_PRESET_KEY = "localmind.activePreset";
   let isStreaming = false;
   /** Abort handle for the in-flight chat stream; null when not streaming. */
   let chatAbortController = null;
@@ -126,6 +139,8 @@
       temperatureInput.value = defaults.temperature;
       temperatureValue.textContent = Number(defaults.temperature).toFixed(2);
       maxTokensInput.value = defaults.max_tokens;
+      // Provisional until loadPresets() selects the active preset; kept as the
+      // fallback if the presets request fails.
       systemPrompt = defaults.system_prompt || "";
       if (management) {
         ttlEnabledInput.checked = Boolean(management.auto_unload_by_default);
@@ -153,6 +168,208 @@
       /* Non-fatal: the UI falls back to its hardcoded defaults. */
     }
   }
+
+  // ---------- System prompt presets ----------
+
+  /** True when the textarea differs from the selected preset's saved content. */
+  function presetIsDirty() {
+    const active = presets.find((p) => p.id === activePresetId);
+    if (!active) return systemPromptInput.value.trim().length > 0;
+    return systemPromptInput.value !== active.content;
+  }
+
+  /** Sync the Save button, status text, and Rename/Delete enablement to state. */
+  function refreshPresetControls() {
+    const active = presets.find((p) => p.id === activePresetId);
+    const dirty = presetIsDirty();
+    presetSaveButton.disabled = !dirty || !systemPromptInput.value.trim();
+    presetRenameButton.disabled = !active;
+    presetDeleteButton.disabled = !active;
+    if (dirty) {
+      presetStatus.textContent = active ? "Unsaved edits" : "Unsaved prompt";
+      presetStatus.classList.add("dirty");
+    } else {
+      presetStatus.textContent = active ? `Using “${active.name}”` : "";
+      presetStatus.classList.remove("dirty");
+    }
+  }
+
+  /** Repopulate the dropdown from `presets`, keeping the active selection. */
+  function renderPresetOptions() {
+    presetSelect.innerHTML = "";
+    for (const preset of presets) {
+      const option = document.createElement("option");
+      option.value = preset.id;
+      option.textContent = preset.name;
+      presetSelect.appendChild(option);
+    }
+    const custom = document.createElement("option");
+    custom.value = "";
+    custom.textContent = "Custom (unsaved)";
+    presetSelect.appendChild(custom);
+    presetSelect.value = activePresetId;
+  }
+
+  /** Make `presetId` active, loading its content into the textarea + prompt. */
+  function applyPreset(presetId, { persist = true } = {}) {
+    const preset = presets.find((p) => p.id === presetId);
+    activePresetId = preset ? preset.id : "";
+    if (preset) {
+      systemPromptInput.value = preset.content;
+      systemPrompt = preset.content;
+    }
+    presetSelect.value = activePresetId;
+    if (persist) {
+      try {
+        if (activePresetId) localStorage.setItem(ACTIVE_PRESET_KEY, activePresetId);
+        else localStorage.removeItem(ACTIVE_PRESET_KEY);
+      } catch { /* localStorage may be unavailable (private mode); ignore. */ }
+    }
+    refreshPresetControls();
+    updateContextMeter();
+  }
+
+  async function loadPresets() {
+    try {
+      const response = await fetch("/api/system-prompts");
+      if (!response.ok) return;
+      const data = await response.json();
+      presets = Array.isArray(data.presets) ? data.presets : [];
+      renderPresetOptions();
+      let stored = "";
+      try { stored = localStorage.getItem(ACTIVE_PRESET_KEY) || ""; } catch { /* ignore */ }
+      const initial = presets.find((p) => p.id === stored) || presets[0];
+      if (initial) {
+        applyPreset(initial.id, { persist: false });
+      } else {
+        // No presets at all: keep the config fallback as a custom prompt.
+        systemPromptInput.value = systemPrompt;
+        refreshPresetControls();
+      }
+    } catch {
+      /* Non-fatal: leave the config-default prompt in place. */
+      systemPromptInput.value = systemPrompt;
+      refreshPresetControls();
+    }
+  }
+
+  // Typing in the textarea takes effect immediately for this session; it
+  // becomes a "Custom (unsaved)" prompt until saved back to a preset.
+  systemPromptInput.addEventListener("input", () => {
+    systemPrompt = systemPromptInput.value;
+    refreshPresetControls();
+    updateContextMeter();
+  });
+
+  presetSelect.addEventListener("change", () => {
+    if (presetSelect.value) {
+      applyPreset(presetSelect.value);
+    } else {
+      // Re-selecting "Custom" just detaches from the active preset.
+      activePresetId = "";
+      try { localStorage.removeItem(ACTIVE_PRESET_KEY); } catch { /* ignore */ }
+      refreshPresetControls();
+    }
+  });
+
+  presetSaveButton.addEventListener("click", async () => {
+    const active = presets.find((p) => p.id === activePresetId);
+    if (!active) return;
+    const content = systemPromptInput.value;
+    try {
+      const response = await fetch(`/api/system-prompts/${active.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not save the preset.");
+      active.content = data.content;
+      systemPrompt = data.content;
+      refreshPresetControls();
+      toast(`Saved “${active.name}”.`);
+    } catch (error) {
+      showError(error.message || "Could not save the preset.");
+    }
+  });
+
+  presetNewButton.addEventListener("click", async () => {
+    const content = systemPromptInput.value.trim();
+    if (!content) {
+      showError("Enter a system prompt before saving it as a preset.");
+      return;
+    }
+    const name = window.prompt("Name for this preset:");
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    try {
+      const response = await fetch("/api/system-prompts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: trimmed, content }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not create the preset.");
+      presets.unshift(data);
+      renderPresetOptions();
+      applyPreset(data.id);
+      toast(`Created “${data.name}”.`);
+    } catch (error) {
+      showError(error.message || "Could not create the preset.");
+    }
+  });
+
+  presetRenameButton.addEventListener("click", async () => {
+    const active = presets.find((p) => p.id === activePresetId);
+    if (!active) return;
+    const name = window.prompt("Rename preset:", active.name);
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === active.name) return;
+    try {
+      const response = await fetch(`/api/system-prompts/${active.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: trimmed }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not rename the preset.");
+      active.name = data.name;
+      renderPresetOptions();
+      refreshPresetControls();
+      toast(`Renamed to “${data.name}”.`);
+    } catch (error) {
+      showError(error.message || "Could not rename the preset.");
+    }
+  });
+
+  presetDeleteButton.addEventListener("click", async () => {
+    const active = presets.find((p) => p.id === activePresetId);
+    if (!active) return;
+    if (!window.confirm(`Delete the preset “${active.name}”?`)) return;
+    try {
+      const response = await fetch(`/api/system-prompts/${active.id}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Could not delete the preset.");
+      }
+      presets = presets.filter((p) => p.id !== active.id);
+      renderPresetOptions();
+      if (presets.length) {
+        applyPreset(presets[0].id);
+      } else {
+        activePresetId = "";
+        presetSelect.value = "";
+        refreshPresetControls();
+      }
+      toast(`Deleted “${active.name}”.`);
+    } catch (error) {
+      showError(error.message || "Could not delete the preset.");
+    }
+  });
 
   // ---------- Models ----------
 
@@ -1765,7 +1982,9 @@
 
   // ---------- Init ----------
 
-  loadDefaults();
+  // loadPresets() runs after loadDefaults() so the config-default prompt is in
+  // place as a fallback before presets (the source of truth) load.
+  loadDefaults().then(loadPresets);
   loadModels();
   checkImageCapability();
   loadConversations();

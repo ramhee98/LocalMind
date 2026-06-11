@@ -25,6 +25,12 @@ Conversation persistence (SQLite, server-side):
   * GET    /api/conversations/{id}   -> full message history
   * PUT    /api/conversations/{id}   -> save messages and/or rename
   * DELETE /api/conversations/{id}   -> delete
+
+System prompt presets (SQLite, server-side — reusable named personas):
+  * GET    /api/system-prompts       -> list presets (newest first)
+  * POST   /api/system-prompts       -> create a named preset
+  * PUT    /api/system-prompts/{id}  -> rename and/or edit content
+  * DELETE /api/system-prompts/{id}  -> delete
 """
 
 from __future__ import annotations
@@ -284,6 +290,10 @@ def searchable_body(messages: list[dict[str, Any]]) -> str:
 FTS_AVAILABLE = True
 
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def init_db() -> None:
     global FTS_AVAILABLE
     with closing(db_connect()) as connection, connection:
@@ -320,6 +330,49 @@ def init_db() -> None:
                 (row["id"], row["title"], searchable_body(messages)))
         if missing:
             logger.info("Backfilled %s conversation(s) into the search index.", len(missing))
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS system_prompts (
+                   id TEXT PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   content TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+               )""")
+        seed_system_prompts(connection)
+
+
+# Starter personas, seeded once into an empty system_prompts table. The first
+# entry mirrors the configured default so the picker always has a baseline.
+def starter_system_prompts() -> list[tuple[str, str]]:
+    return [
+        ("Default", CONFIG["defaults"]["system_prompt"]),
+        ("Code reviewer",
+         "You are a meticulous senior software engineer reviewing code. "
+         "Point out bugs, edge cases, security issues, and style problems. "
+         "Be concise, cite specific lines, and suggest concrete fixes."),
+        ("Translator",
+         "You are a professional translator. Translate the user's text "
+         "faithfully, preserving tone and meaning. If the target language is "
+         "ambiguous, ask. Output only the translation unless asked otherwise."),
+        ("Socratic tutor",
+         "You are a Socratic tutor. Never give the answer outright. Guide the "
+         "user to it with probing questions, hints, and small steps, checking "
+         "their understanding as you go."),
+    ]
+
+
+def seed_system_prompts(connection: sqlite3.Connection) -> None:
+    """Populate the presets table with starters the first time it is empty."""
+    existing = connection.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0]
+    if existing:
+        return
+    now = utc_now()
+    for name, content in starter_system_prompts():
+        connection.execute(
+            "INSERT INTO system_prompts (id, name, content, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, name, content, now, now))
+    logger.info("Seeded %s starter system prompt(s).", len(starter_system_prompts()))
 
 
 init_db()
@@ -349,8 +402,19 @@ class ConversationUpdate(BaseModel):
         default=None, max_length=MAX_CONVERSATION_MESSAGES)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# Generous but finite, so an unauthenticated POST can't store an unbounded blob.
+MAX_SYSTEM_PROMPT_CHARS = 20000
+
+
+class SystemPromptCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=MAX_SYSTEM_PROMPT_CHARS)
+
+
+class SystemPromptUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    content: Optional[str] = Field(
+        default=None, min_length=1, max_length=MAX_SYSTEM_PROMPT_CHARS)
 
 
 def derive_title(messages: list[dict[str, Any]]) -> Optional[str]:
@@ -518,6 +582,75 @@ def delete_conversation(conversation_id: str) -> JSONResponse:
         return JSONResponse(status_code=404, content={"error": "Conversation not found."})
     logger.info("Deleted conversation %s", conversation_id)
     return JSONResponse(content={"status": "deleted", "id": conversation_id})
+
+
+# ---------- System prompt presets ----------
+
+@app.get("/api/system-prompts")
+def list_system_prompts() -> dict[str, Any]:
+    with closing(db_connect()) as connection:
+        rows = connection.execute(
+            "SELECT id, name, content, created_at, updated_at FROM system_prompts "
+            "ORDER BY updated_at DESC").fetchall()
+    return {"presets": [dict(row) for row in rows]}
+
+
+@app.post("/api/system-prompts")
+async def create_system_prompt(http_request: Request) -> JSONResponse:
+    try:
+        request = SystemPromptCreate.model_validate_json(await http_request.body())
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"error": str(exc)})
+    preset_id = uuid.uuid4().hex
+    now = utc_now()
+    with closing(db_connect()) as connection, connection:
+        connection.execute(
+            "INSERT INTO system_prompts (id, name, content, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (preset_id, request.name, request.content, now, now))
+    logger.info("Created system prompt %s (%s)", preset_id, request.name)
+    return JSONResponse(content={
+        "id": preset_id, "name": request.name, "content": request.content,
+        "created_at": now, "updated_at": now,
+    })
+
+
+@app.put("/api/system-prompts/{preset_id}")
+async def update_system_prompt(preset_id: str, http_request: Request) -> JSONResponse:
+    try:
+        request = SystemPromptUpdate.model_validate_json(await http_request.body())
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"error": str(exc)})
+    if request.name is None and request.content is None:
+        return JSONResponse(status_code=422, content={
+            "error": "Provide a name and/or content to update."})
+    with closing(db_connect()) as connection, connection:
+        row = connection.execute(
+            "SELECT name, content FROM system_prompts WHERE id = ?",
+            (preset_id,)).fetchone()
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "Preset not found."})
+        name = request.name if request.name is not None else row["name"]
+        content = request.content if request.content is not None else row["content"]
+        now = utc_now()
+        connection.execute(
+            "UPDATE system_prompts SET name = ?, content = ?, updated_at = ? "
+            "WHERE id = ?",
+            (name, content, now, preset_id))
+    return JSONResponse(content={
+        "id": preset_id, "name": name, "content": content, "updated_at": now,
+    })
+
+
+@app.delete("/api/system-prompts/{preset_id}")
+def delete_system_prompt(preset_id: str) -> JSONResponse:
+    with closing(db_connect()) as connection, connection:
+        deleted = connection.execute(
+            "DELETE FROM system_prompts WHERE id = ?", (preset_id,)).rowcount
+    if not deleted:
+        return JSONResponse(status_code=404, content={"error": "Preset not found."})
+    logger.info("Deleted system prompt %s", preset_id)
+    return JSONResponse(content={"status": "deleted", "id": preset_id})
 
 
 # ---------- Document upload ----------
