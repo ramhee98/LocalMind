@@ -26,6 +26,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Edit & regenerate** — hover any of your messages to ✏️ edit it (attachments are preserved) or any answer to ↻ regenerate it; the conversation is truncated at that point and re-streamed, with a confirmation if later messages would be discarded.
 - **Context-window meter** — a gauge in the composer estimates the prompt size (system prompt, history, attachments, retrieved RAG chunks, and your draft) against the loaded model's actual context window, turning yellow at 80% and red at 95%.
 - **Document retrieval (RAG)** — long uploads are chunked, embedded with a local embedding model, and queried by relevance per question (only the top matches enter the prompt) — so you can chat about a big PDF without blowing the context window. Small docs are still inlined.
+- **Web search (🌐 toggle)** — flip the composer toggle to search the web for your question and inject the top results into the prompt, with sources cited inline as links. Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -150,6 +151,21 @@ Conversations are persisted server-side in a SQLite database under `data/` (giti
 ### Document retrieval (RAG)
 
 Small attached documents are inlined into the prompt as before. Documents at least `rag.min_chars_for_rag` characters long are instead **indexed for retrieval**: on upload they are chunked and embedded with a local LM Studio embedding model (`text-embedding-nomic-embed-text-v1.5` by default, loaded on demand), and the attachment chip shows “🔍 searchable”. For each question, only the most relevant chunks (`rag.top_k`) are embedded-matched and injected — so you can chat about a long PDF without it consuming the whole context window or being truncated. Follow-up questions keep using the same documents for the rest of the session. If the embedding model is unavailable, the upload falls back to inlining the (truncated) text, and retrieval misses degrade to answering without the document rather than erroring.
+
+### Web search
+
+Turn on the **🌐 Web search** toggle in the composer to ground answers in live web results: your question is searched, and the top hits (title, URL, snippet) are injected into the prompt — the model is asked to cite the sources it uses as inline links. The toggle state is remembered across reloads, and a "Searching the web…" note shows in the reply bubble while the search runs.
+
+Configured under `web_search` in `config.json`:
+
+- `provider` — `duckduckgo` (default, no API key or setup needed) or `searxng`.
+- `searxng_base_url` — your [SearXNG](https://docs.searxng.org/) instance, e.g. `http://localhost:8888`, if you prefer to keep search queries on infrastructure you control. The instance must allow the JSON output format (`formats: [html, json]` in its `settings.yml`).
+- `max_results` / `timeout_seconds` — how many results to inject and how long to wait.
+- `enabled: false` hides the toggle entirely.
+
+If a search fails (offline, rate-limited, misconfigured), a toast explains why and the model answers from its own knowledge instead of erroring.
+
+> Note: web search sends your question to the search provider (DuckDuckGo, or your SearXNG instance and the engines it queries). Leave the toggle off for conversations that should stay fully local.
 
 ### Attaching files and images
 

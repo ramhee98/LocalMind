@@ -112,6 +112,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chunk_overlap": 200,
         "top_k": 5,
     },
+    "web_search": {
+        # Master switch; when False the composer toggle is hidden entirely.
+        "enabled": True,
+        # "duckduckgo" works with zero setup (no API key, via the ddgs
+        # package); "searxng" queries a self-hosted SearXNG instance and
+        # requires searxng_base_url (the instance must allow format=json).
+        "provider": "duckduckgo",
+        "searxng_base_url": None,
+        "max_results": 5,
+        "timeout_seconds": 15,
+    },
     "tls": {
         "enabled": False,
         "cert_file": None,
@@ -204,6 +215,9 @@ class ChatRequest(BaseModel):
     # RAG document ids; relevant chunks are retrieved and prepended to the
     # last user turn instead of inlining whole documents.
     doc_ids: Optional[list[str]] = Field(default=None)
+    # When true, web search results for the user's question are prepended to
+    # the last user turn (same injection mechanism as RAG).
+    web_search: bool = Field(default=False)
     # Idle TTL (seconds) for LM Studio to apply when this request JIT-loads the
     # model. None means "use the configured default"; 0 disables auto-unload.
     ttl_seconds: Optional[int] = Field(default=None, ge=0, le=86400 * 7)
@@ -258,6 +272,8 @@ def get_config() -> dict[str, Any]:
             "top_k": CONFIG["rag"]["top_k"],
             "chunk_chars": CONFIG["rag"]["chunk_chars"],
         },
+        # Lets the UI hide the composer toggle when web search is turned off.
+        "web_search": {"enabled": CONFIG["web_search"]["enabled"]},
         "base_url": CONFIG["lm_studio_base_url"],
     }
 
@@ -1354,18 +1370,14 @@ def last_user_query(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def apply_rag(messages: list[dict[str, Any]], doc_ids: list[str]) -> list[dict[str, Any]]:
-    """Prepend retrieved chunks to the final user turn for the given documents."""
-    query = last_user_query(messages)
-    context = retrieve_context(doc_ids, query) if query else ""
-    if not context:
-        return messages
+def prepend_to_last_user_turn(
+    messages: list[dict[str, Any]], preamble: str
+) -> list[dict[str, Any]]:
+    """Return a copy of `messages` with `preamble` prepended to the last user turn."""
     augmented = [dict(message) for message in messages]
     for message in reversed(augmented):
         if message.get("role") != "user":
             continue
-        preamble = ("Use the following excerpts from the user's uploaded "
-                    "documents to answer.\n\n" + context + "\n\n")
         content = message["content"]
         if isinstance(content, str):
             message["content"] = preamble + content
@@ -1373,6 +1385,113 @@ def apply_rag(messages: list[dict[str, Any]], doc_ids: list[str]) -> list[dict[s
             message["content"] = [{"type": "text", "text": preamble}, *content]
         break
     return augmented
+
+
+def apply_rag(messages: list[dict[str, Any]], doc_ids: list[str]) -> list[dict[str, Any]]:
+    """Prepend retrieved chunks to the final user turn for the given documents."""
+    query = last_user_query(messages)
+    context = retrieve_context(doc_ids, query) if query else ""
+    if not context:
+        return messages
+    preamble = ("Use the following excerpts from the user's uploaded "
+                "documents to answer.\n\n" + context + "\n\n")
+    return prepend_to_last_user_turn(messages, preamble)
+
+
+# ---------- Web search ----------
+
+class WebSearchError(Exception):
+    """Raised when a web search cannot be performed; the chat continues without it."""
+
+
+def search_duckduckgo(query: str, max_results: int) -> list[dict[str, str]]:
+    """Search DuckDuckGo via the ddgs package (no API key required)."""
+    try:
+        from ddgs import DDGS
+    except ImportError as exc:
+        raise WebSearchError(
+            "the ddgs package is not installed — run: pip install ddgs"
+        ) from exc
+    raw = None
+    last_error: Optional[Exception] = None
+    # ddgs rotates between backends, some of which fail transiently; one
+    # retry picks a different backend and resolves most hiccups.
+    for _ in range(2):
+        try:
+            with DDGS(timeout=CONFIG["web_search"]["timeout_seconds"]) as ddgs:
+                raw = ddgs.text(query, max_results=max_results)
+            break
+        except Exception as exc:  # noqa: BLE001 — ddgs raises library-specific errors
+            last_error = exc
+    if raw is None:
+        raise WebSearchError(f"DuckDuckGo search failed: {last_error}") from last_error
+    return [
+        {
+            "title": item.get("title") or "",
+            "url": item.get("href") or "",
+            "snippet": item.get("body") or "",
+        }
+        for item in raw or []
+    ]
+
+
+def search_searxng(query: str, max_results: int) -> list[dict[str, str]]:
+    """Search a self-hosted SearXNG instance (its settings must allow format=json)."""
+    base_url = (CONFIG["web_search"]["searxng_base_url"] or "").rstrip("/")
+    if not base_url:
+        raise WebSearchError("searxng_base_url is not configured")
+    try:
+        response = httpx.get(
+            f"{base_url}/search",
+            params={"q": query, "format": "json"},
+            timeout=CONFIG["web_search"]["timeout_seconds"],
+        )
+        response.raise_for_status()
+        results = response.json().get("results", [])
+    except (httpx.HTTPError, ValueError) as exc:
+        raise WebSearchError(f"SearXNG request failed: {exc}") from exc
+    return [
+        {
+            "title": item.get("title") or "",
+            "url": item.get("url") or "",
+            "snippet": item.get("content") or "",
+        }
+        for item in results[:max_results]
+    ]
+
+
+def run_web_search(query: str) -> list[dict[str, str]]:
+    """Dispatch to the configured search provider."""
+    provider = CONFIG["web_search"]["provider"]
+    max_results = CONFIG["web_search"]["max_results"]
+    if provider == "searxng":
+        return search_searxng(query, max_results)
+    if provider == "duckduckgo":
+        return search_duckduckgo(query, max_results)
+    raise WebSearchError(f"unknown web search provider: {provider}")
+
+
+def apply_web_search(messages: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Prepend web search results for `query` to the final user turn.
+
+    `query` is the original user question, passed explicitly because RAG may
+    already have prepended document context to the message by this point.
+    """
+    # Search engines cap query length; the first sentences carry the intent.
+    results = run_web_search(query[:400])
+    if not results:
+        return messages
+    blocks = [
+        f"[{index}] {item['title']}\n{item['url']}\n{item['snippet']}"
+        for index, item in enumerate(results, 1)
+    ]
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    preamble = (
+        f"Web search results retrieved {today} (UTC). Use them to answer when "
+        "relevant and cite sources inline as markdown links.\n\n"
+        + "\n\n".join(blocks) + "\n\n"
+    )
+    return prepend_to_last_user_turn(messages, preamble)
 
 
 def stream_completion(request: ChatRequest) -> Iterator[str]:
@@ -1384,8 +1503,20 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
     stream = None
     try:
         outgoing = [message.model_dump() for message in request.messages]
+        # Capture the user's question before RAG prepends document context to it.
+        query = last_user_query(outgoing)
         if request.doc_ids:
             outgoing = apply_rag(outgoing, request.doc_ids)
+        if request.web_search and CONFIG["web_search"]["enabled"] and query:
+            yield f"data: {json.dumps({'status': '🌐 Searching the web…'})}\n\n"
+            try:
+                outgoing = apply_web_search(outgoing, query)
+            except WebSearchError as exc:
+                # Degrade gracefully: surface the failure as a toast and let
+                # the model answer from its own knowledge.
+                logger.warning("Web search failed: %s", exc)
+                notice = f"Web search failed — {exc}. Answering without web results."
+                yield f"data: {json.dumps({'notice': notice})}\n\n"
         extra_body: dict[str, Any] = {}
         if request.reasoning_effort:
             extra_body["reasoning_effort"] = request.reasoning_effort

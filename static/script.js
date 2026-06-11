@@ -49,6 +49,7 @@
   const composerControls = document.getElementById("composer-controls");
   const thinkingModeSelect = document.getElementById("thinking-mode");
   const effortLevelSelect = document.getElementById("effort-level");
+  const webSearchToggle = document.getElementById("web-search-toggle");
   const sidebar = document.getElementById("sidebar");
   const sidebarToggle = document.getElementById("sidebar-toggle");
   const sidebarBackdrop = document.getElementById("sidebar-backdrop");
@@ -91,6 +92,10 @@
   let contextWindows = {};
   /** RAG retrieval parameters from the server, for token estimation. */
   let ragEstimate = { top_k: 0, chunk_chars: 0 };
+  /** Whether to augment the next message with web search results. */
+  let webSearchEnabled = false;
+  /** localStorage key remembering the web search toggle across reloads. */
+  const WEB_SEARCH_KEY = "localmind.webSearch";
 
   // ---------- Error banner ----------
 
@@ -152,6 +157,10 @@
       }
       if (data.rag?.top_k) {
         ragEstimate = { top_k: data.rag.top_k, chunk_chars: data.rag.chunk_chars || 0 };
+      }
+      if (data.web_search && !data.web_search.enabled) {
+        webSearchToggle.classList.add("hidden");
+        if (webSearchEnabled) setWebSearch(false);
       }
       const defaultSize = data.image_generation?.default_size;
       if (defaultSize) {
@@ -1058,6 +1067,25 @@
     effortLevelSelect.disabled = thinkingModeSelect.value !== "on";
   });
 
+  // ---------- Web search toggle ----------
+
+  function setWebSearch(on) {
+    webSearchEnabled = on;
+    webSearchToggle.classList.toggle("active", on);
+    webSearchToggle.setAttribute("aria-pressed", String(on));
+    try {
+      if (on) localStorage.setItem(WEB_SEARCH_KEY, "1");
+      else localStorage.removeItem(WEB_SEARCH_KEY);
+    } catch { /* localStorage may be unavailable (private mode); ignore. */ }
+  }
+
+  webSearchToggle.addEventListener("click", () => setWebSearch(!webSearchEnabled));
+
+  // Restore the last toggle state; the server config may still hide it.
+  try {
+    if (localStorage.getItem(WEB_SEARCH_KEY) === "1") setWebSearch(true);
+  } catch { /* ignore */ }
+
   function setImageMode(on) {
     imageMode = on;
     imageToggle.classList.toggle("active", on);
@@ -1924,6 +1952,7 @@
       max_tokens: Math.max(1, Math.floor(Number(maxTokensInput.value) || 1024)),
       ...(reasoningEffortValue() ? { reasoning_effort: reasoningEffortValue() } : {}),
       ...(docIds.size ? { doc_ids: [...docIds] } : {}),
+      ...(webSearchEnabled ? { web_search: true } : {}),
       // Drive LM Studio's idle auto-unload from the load panel's TTL control.
       // It only takes effect when this message JIT-loads the model; an
       // already-loaded instance keeps the TTL it was loaded with. Unchecked
@@ -2013,6 +2042,21 @@
           if (parsed.error) throw new Error(parsed.error);
           // Capture pin state before mutating, so growth doesn't unpin us.
           const pinned = isPinnedToBottom();
+          if (parsed.status && !assistantContent) {
+            // Transient progress note (e.g. web search); the first answer
+            // tokens overwrite it via renderMarkdown below.
+            ensureContentSpan();
+            contentSpan.textContent = "";
+            const note = document.createElement("em");
+            note.className = "stream-status";
+            note.textContent = parsed.status;
+            contentSpan.appendChild(note);
+            if (pinned) chatWindow.scrollTop = chatWindow.scrollHeight;
+          }
+          if (parsed.notice) {
+            // Non-fatal server-side warning (e.g. web search failed).
+            toast(parsed.notice, "error", 8000);
+          }
           if (parsed.reasoning) {
             appendReasoning(parsed.reasoning);
             if (pinned) chatWindow.scrollTop = chatWindow.scrollHeight;
@@ -2030,6 +2074,8 @@
       finishThinking();
       // Final render adds the code-block copy buttons.
       if (assistantContent && contentSpan) renderMarkdown(contentSpan, assistantContent);
+      // Drop a leftover status note if the stream produced no answer text.
+      if (!assistantContent && contentSpan) contentSpan.textContent = "";
       // Only the final answer (not the thinking) goes back into the history.
       messages.push({ role: "assistant", content: assistantContent });
       attachMessageActions(assistantBubble, "assistant", messages.length - 1);

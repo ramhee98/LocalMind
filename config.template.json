@@ -35,6 +35,13 @@
     "chunk_overlap": 200,
     "top_k": 5
   },
+  "web_search": {
+    "enabled": true,
+    "provider": "duckduckgo",
+    "searxng_base_url": null,
+    "max_results": 5,
+    "timeout_seconds": 15
+  },
   "tls": {
     "enabled": false,
     "cert_file": null,

@@ -1002,6 +1002,40 @@ input[type="number"] {
   cursor: not-allowed;
 }
 
+.composer-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.composer-toggle:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.composer-toggle.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(108, 140, 255, 0.15);
+  box-shadow: 0 0 8px rgba(108, 140, 255, 0.35);
+}
+
+/* Transient status (e.g. "Searching the web…") shown in the pending
+   assistant bubble until the first answer tokens replace it. */
+.stream-status {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 /* ---------- Context-window meter ---------- */
 
 .context-meter {
