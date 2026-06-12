@@ -46,6 +46,8 @@
     "fetch_pages": true,
     "top_k": 6,
     "max_page_chars": 20000,
+    "crawl_max_pages": 8,
+    "linked_top_k": 10,
     "research_max_rounds": 2,
     "research_queries_per_round": 3,
     "research_top_k": 12

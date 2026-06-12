@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterator, Optional, Union
+from urllib.parse import parse_qsl, urldefrag, urljoin, urlsplit
 
 import httpx
 from fastapi import FastAPI, File, Request, UploadFile
@@ -142,6 +143,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "top_k": 6,
         # Extracted text per page is capped at this many characters.
         "max_page_chars": 20000,
+        # Pasted URLs: when the message asks for a deep dive into a site (or
+        # restricts sources to the link), same-site links found on the pasted
+        # pages are crawled too, up to this many pages in total.
+        "crawl_max_pages": 8,
+        # How many ranked excerpts from linked/crawled pages to inject.
+        "linked_top_k": 10,
         # Research mode: the question is decomposed into sub-queries, each is
         # searched and read, then the model reviews what was found and
         # proposes follow-up queries for the gaps — repeated up to
@@ -1566,7 +1573,7 @@ def rewrite_search_query(model: str, messages: list[dict[str, Any]], fallback: s
 
 
 class _PageTextExtractor(HTMLParser):
-    """Collect the readable text of an HTML page.
+    """Collect the readable text of an HTML page, plus the hrefs of its links.
 
     Only reliably-closed non-content containers are skipped; boilerplate like
     nav/footer text is left in because malformed pages often leave those tags
@@ -1580,10 +1587,15 @@ class _PageTextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._skip_depth = 0
         self.parts: list[str] = []
+        self.links: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
         if tag in self.SKIP_TAGS:
             self._skip_depth += 1
+        elif tag == "a":
+            for name, value in attrs:
+                if name == "href" and value:
+                    self.links.append(value)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self.SKIP_TAGS and self._skip_depth:
@@ -1594,56 +1606,71 @@ class _PageTextExtractor(HTMLParser):
             self.parts.append(data.strip())
 
 
-def extract_page_text(html: str) -> str:
+BROWSER_HEADERS = {
+    # Some sites reject the default httpx user agent outright.
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0 Safari/537.36"),
+    "Accept-Language": "en",
+}
+
+
+def fetch_page(url: str) -> tuple[str, list[str], str]:
+    """Fetch one page; returns (readable text, hrefs on it, final URL after redirects).
+
+    The body is streamed and capped so a link to a large download can't
+    exhaust memory; the cap leaves generous headroom for HTML markup around
+    max_page_chars of extractable text.
+    """
+    config = CONFIG["web_search"]
     parser = _PageTextExtractor()
-    try:
-        parser.feed(html)
-        parser.close()
-    except Exception:  # noqa: BLE001 — never let a weird page kill the search
-        pass
-    return "\n".join(parser.parts)
+    with httpx.stream("GET", url, timeout=config["timeout_seconds"],
+                      follow_redirects=True, headers=BROWSER_HEADERS) as response:
+        response.raise_for_status()
+        final_url = str(response.url)
+        if "html" not in response.headers.get("content-type", "html"):
+            return "", [], final_url
+        max_html_chars = config["max_page_chars"] * 20
+        read = 0
+        try:
+            for piece in response.iter_text():
+                parser.feed(piece)
+                read += len(piece)
+                if read >= max_html_chars:
+                    break
+            parser.close()
+        except Exception:  # noqa: BLE001 — never let a weird page kill the fetch
+            pass
+    return "\n".join(parser.parts)[: config["max_page_chars"]], parser.links, final_url
 
 
 def fetch_page_texts(results: list[dict[str, str]]) -> dict[str, str]:
     """Download the result pages concurrently; failures are skipped."""
-    config = CONFIG["web_search"]
-    headers = {
-        # Some sites reject the default httpx user agent outright.
-        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0 Safari/537.36"),
-        "Accept-Language": "en",
-    }
-
-    def fetch(url: str) -> str:
-        response = httpx.get(url, timeout=config["timeout_seconds"],
-                             follow_redirects=True, headers=headers)
-        response.raise_for_status()
-        if "html" not in response.headers.get("content-type", "html"):
-            return ""
-        return extract_page_text(response.text)[: config["max_page_chars"]]
-
     texts: dict[str, str] = {}
     urls = [item["url"] for item in results if item["url"]]
     with ThreadPoolExecutor(max_workers=min(5, len(urls) or 1)) as pool:
-        futures = {pool.submit(fetch, url): url for url in urls}
+        futures = {pool.submit(fetch_page, url): url for url in urls}
         for future in as_completed(futures):
             url = futures[future]
             try:
-                texts[url] = future.result()
-            except httpx.HTTPError as exc:
+                texts[url] = future.result()[0]
+            except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
                 logger.info("Skipping web result %s: %s", url, exc)
     return texts
 
 
-def web_search_context(query: str) -> str:
+def web_search_context(query: str, only_hosts: Optional[set[str]] = None) -> str:
     """Search the web and build a context block for prompt injection.
 
     With fetch_pages on, the top result pages are downloaded and their chunks
     embed-ranked against the query (the RAG pipeline); when pages or the
     embedding model are unavailable, the result snippets are used instead.
+    `only_hosts` drops results from other sites — engines don't always honor
+    a site: operator strictly, so the restriction is enforced here too.
     """
     results = run_web_search(query)
+    if only_hosts:
+        results = [item for item in results if _same_site(item["url"], only_hosts)]
     if not results:
         return ""
     # The snippets always go in: for weather/news-style queries they often
@@ -1690,21 +1717,29 @@ def rank_chunks_by_query(
     return [pair for pair, _ in scored[:top_k]]
 
 
-def apply_web_search(messages: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+def apply_web_search(
+    messages: list[dict[str, Any]], query: str,
+    only_hosts: Optional[set[str]] = None, supplementary: bool = False,
+) -> list[dict[str, Any]]:
     """Prepend web search results for `query` to the final user turn.
 
     `query` is passed explicitly because RAG may already have prepended
-    document context to the message by this point.
+    document context to the message by this point. `supplementary` marks the
+    results as secondary to pages the user linked themselves.
     """
     # Search engines cap query length; the first sentences carry the intent.
-    context = web_search_context(query[:400])
+    context = web_search_context(query[:400], only_hosts)
     if not context:
         return messages
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    precedence = (
+        " The pages the user linked (provided separately) are the primary "
+        "sources; use these results only to fill gaps." if supplementary else ""
+    )
     preamble = (
         f"Web search results retrieved {today} (UTC). Use them to answer when "
-        "relevant and cite sources inline as markdown links.\n\n"
-        + context + "\n\n"
+        "relevant and cite sources inline as markdown links." + precedence
+        + "\n\n" + context + "\n\n"
     )
     return prepend_to_last_user_turn(messages, preamble)
 
@@ -1727,39 +1762,236 @@ def extract_urls(text: str) -> list[str]:
         # unless the URL itself contains an opening paren (Wikipedia titles).
         if url.endswith(")") and "(" not in url:
             url = url[:-1]
+        # Drop URLs urlsplit can't parse (stray brackets and the like) — they
+        # would raise ValueError deep inside the pipeline otherwise.
+        if not _host_of(url):
+            continue
         if url not in urls:
             urls.append(url)
     return urls[:5]
 
 
-def linked_pages_context(query: str, urls: list[str]) -> tuple[str, list[str]]:
-    """Fetch user-pasted URLs; returns (context block, URLs that failed).
+def _host_of(url: str) -> str:
+    """Lowercased hostname without port or a www. prefix; "" when unparsable."""
+    try:
+        return (urlsplit(url).hostname or "").removeprefix("www.")
+    except ValueError:
+        return ""
+
+
+def _same_site(url: str, hosts: set[str]) -> bool:
+    """Whether `url` belongs to one of the (www-stripped) hosts, subdomains included."""
+    host = _host_of(url)
+    return bool(host) and any(host == h or host.endswith("." + h) for h in hosts)
+
+
+# Link targets that can't contain readable HTML — skipped during a crawl so
+# they don't burn fetch attempts (the content-type check is the backstop).
+NON_HTML_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".svg",
+    ".ico", ".css", ".js", ".pdf", ".zip", ".gz", ".mp3", ".m4a", ".wav",
+    ".mp4", ".mov", ".webm", ".xml", ".rss", ".atom", ".json", ".txt",
+    ".docx", ".xlsx", ".pptx",
+)
+
+# Query parameters that never change the content behind a link: share
+# buttons, comment-reply anchors, click tracking.
+JUNK_QUERY_PARAMS = ("share", "replytocom", "fbclid", "gclid", "ref")
+
+
+def crawl_dedup_key(url: str) -> str:
+    """Canonical URL form for crawl dedup.
+
+    Collapses scheme, www., trailing-slash and share/tracking-parameter
+    variants, which all serve the page already fetched (WordPress-style
+    ?share=twitter / ?replytocom= / ?utm_* links) and would otherwise burn
+    the page budget on duplicates.
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").removeprefix("www.")
+    params = sorted(
+        (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not (key.startswith("utm_") or key in JUNK_QUERY_PARAMS))
+    query = "&".join(f"{key}={value}" for key, value in params)
+    return f"{host}{parts.path.rstrip('/')}" + (f"?{query}" if query else "")
+
+
+def collect_site_links(page_url: str, hrefs: list[str], hosts: set[str]) -> list[str]:
+    """Absolute same-site links from a page's hrefs, in document order."""
+    links: list[str] = []
+    for href in hrefs:
+        try:
+            absolute = urldefrag(urljoin(page_url, href)).url
+            parts = urlsplit(absolute)
+        except ValueError:
+            # Malformed href (stray brackets and the like) — skip it.
+            continue
+        if parts.scheme not in ("http", "https"):
+            continue
+        if not _same_site(absolute, hosts):
+            continue
+        if parts.path.lower().endswith(NON_HTML_EXTENSIONS):
+            continue
+        links.append(absolute)
+    # Shallow paths first (stable, so document order breaks ties): top-level
+    # pages like /about and /episodes describe a site, while deep paths are
+    # leaves — single posts, share/like action pages.
+    links.sort(key=lambda link: urlsplit(link).path.count("/"))
+    return links
+
+
+def crawl_site_texts(start_urls: list[str], max_pages: int) -> dict[str, str]:
+    """Fetch the pasted pages plus same-site links, breadth-first, up to max_pages.
+
+    A single linked page rarely answers questions about a site as a whole —
+    the "what is this podcast about?" answer lives on /about or the episode
+    pages, not the homepage — so a deep dive follows the site's own links.
+    """
+    hosts = {h for h in (_host_of(url) for url in start_urls) if h}
+    seen = {crawl_dedup_key(url) for url in start_urls}
+    frontier = list(start_urls)
+    texts: dict[str, str] = {}
+    attempts = 0
+    # Only pages that yielded text fill the page budget; the attempts cap
+    # bounds the crawl when many links error out or turn out not to be HTML.
+    while frontier and len(texts) < max_pages and attempts < max_pages * 4:
+        batch = frontier[: max_pages - len(texts)]
+        frontier = frontier[len(batch):]
+        attempts += len(batch)
+        with ThreadPoolExecutor(max_workers=min(5, len(batch))) as pool:
+            futures = {pool.submit(fetch_page, url): url for url in batch}
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    text, hrefs, final_url = future.result()
+                except Exception as exc:  # noqa: BLE001 — a weird link must not kill the crawl
+                    logger.info("Skipping crawled page %s: %s", url, exc)
+                    continue
+                if url in start_urls:
+                    # Redirects off a pasted page (http→https, a shortlink)
+                    # define the site the user actually meant.
+                    if _host_of(final_url):
+                        hosts.add(_host_of(final_url))
+                elif not _same_site(final_url, hosts):
+                    # A same-site link that redirected off-site — don't let
+                    # foreign content masquerade as the linked site's.
+                    logger.info("Skipping off-site redirect %s -> %s", url, final_url)
+                    continue
+                seen.add(crawl_dedup_key(final_url))
+                if text:
+                    texts[url] = text
+                # Resolve hrefs against the final URL: after a redirect (say
+                # /blog -> /blog/), relative links are wrong otherwise.
+                for link in collect_site_links(final_url, hrefs, hosts):
+                    key = crawl_dedup_key(link)
+                    if key not in seen:
+                        seen.add(key)
+                        frontier.append(link)
+    return texts
+
+
+LINKED_USAGE_SYSTEM_PROMPT = (
+    "You classify how a chat message wants its web links used. Reply with two "
+    "words: ONLY or ANY, then SITE or PAGE.\n"
+    "ONLY = the user restricts sources to the linked pages (\"use no other "
+    "pages\", \"only this site as a source\"). ANY = no such restriction.\n"
+    "SITE = the linked website as a whole matters (deep dive, what is this "
+    "site/podcast/company about). PAGE = the linked page alone is enough.\n"
+    "The message may be in any language.\n\n"
+    "Examples:\n"
+    "\"summarize https://x.ch/article\" -> ANY PAGE\n"
+    "\"deep dive through https://x.ch use no other pages as a source\" -> ONLY SITE\n"
+    "\"what is this podcast about? https://pod.ch\" -> ANY SITE\n"
+    "\"only use https://shop.ch as source: what do they sell?\" -> ONLY SITE\n"
+    "\"tell me what https://firm.ch offers\" -> ANY SITE\n"
+    "\"is https://a.ch/post consistent with current research?\" -> ANY PAGE\n"
+    "Reply with the two words only."
+)
+
+
+def classify_linked_usage(model: str, query: str) -> tuple[bool, bool]:
+    """(restrict to linked pages, crawl the site) for a message with URLs.
+
+    An explicit source restriction implies crawling: when the linked site is
+    the only allowed source, one page of it is rarely enough. Falls back to
+    (False, False) — fetch the pasted pages, keep searching — on any failure,
+    which is the pre-classification behavior.
+    """
+    text = quick_completion(model, LINKED_USAGE_SYSTEM_PROMPT, query[:2000],
+                            max_tokens=200)
+    if not text:
+        return False, False
+    upper = text.upper()
+    # Anchor on the first "ONLY/ANY SITE/PAGE" pair, falling back to the
+    # first occurrence of each label alone — the label words also appear in
+    # explanatory prose ("the user did not say to use only…"), which must
+    # not flip the result.
+    pair = re.search(r"\b(ONLY|ANY)\b\W+(SITE|PAGE)\b", upper)
+    if pair:
+        restrict = pair.group(1) == "ONLY"
+        return restrict, restrict or pair.group(2) == "SITE"
+    scope = re.search(r"\b(ONLY|ANY)\b", upper)
+    depth = re.search(r"\b(SITE|PAGE)\b", upper)
+    restrict = scope is not None and scope.group(1) == "ONLY"
+    return restrict, restrict or (depth is not None and depth.group(1) == "SITE")
+
+
+def linked_pages_context(query: str, urls: list[str], crawl: bool) -> tuple[str, list[str]]:
+    """Fetch user-pasted URLs; returns (context block, pasted URLs that failed).
 
     Search engines never index small or new sites, so pasted links are
-    fetched directly instead of searched for. Short pages are inlined whole;
-    long ones are embed-ranked against the question (leading text when
-    embeddings are unavailable).
+    fetched directly instead of searched for. Short pasted pages are inlined
+    whole; everything else — long pages, and with `crawl` the same-site pages
+    linked from the pasted ones — is embed-ranked against the question
+    (leading text of the pasted pages when embeddings are unavailable).
     """
-    texts = fetch_page_texts([{"title": url, "url": url, "snippet": ""} for url in urls])
+    config = CONFIG["web_search"]
     rag = CONFIG["rag"]
+    if crawl:
+        texts = crawl_site_texts(urls, max(len(urls), int(config["crawl_max_pages"])))
+    else:
+        texts = fetch_page_texts([{"title": url, "url": url, "snippet": ""} for url in urls])
+    failed = [url for url in urls if not texts.get(url)]
     blocks: list[str] = []
-    failed: list[str] = []
+    pool: list[tuple[dict[str, str], str]] = []
+    overflow: list[str] = []  # pasted pages too long to inline
     for url in urls:
         text = texts.get(url, "")
         if not text:
-            failed.append(url)
             continue
         if len(text) <= LINKED_PAGE_INLINE_CHARS:
             blocks.append(f"[{url}]\n{text}")
-            continue
-        pool = [({"title": url, "url": url}, chunk)
-                for chunk in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"])]
-        top = rank_chunks_by_query(query, pool, CONFIG["web_search"]["top_k"])
-        if top is None:
-            blocks.append(f"[{url}]\n{text[:LINKED_PAGE_INLINE_CHARS]}")
         else:
-            excerpts = "\n\n".join(chunk for _, chunk in top)
-            blocks.append(f"[{url}] (most relevant excerpts)\n{excerpts}")
+            overflow.append(url)
+            pool.extend(({"url": url}, chunk) for chunk
+                        in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"]))
+    for url, text in texts.items():
+        if url in urls or not text:
+            continue
+        pool.extend(({"url": url}, chunk) for chunk
+                    in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"]))
+    if pool:
+        capped = pool[:RESEARCH_POOL_CAP]
+        ranked = rank_chunks_by_query(query, capped, len(capped))
+        if ranked is None:
+            # No embeddings: keep the lead of the long pasted pages, as before.
+            blocks.extend(f"[{url}]\n{texts[url][:LINKED_PAGE_INLINE_CHARS]}"
+                          for url in overflow)
+        else:
+            top = ranked[: config["linked_top_k"]]
+            # Every page the user pasted deserves representation — don't let
+            # one long page crowd the others out of the excerpt slots.
+            extras = []
+            for url in overflow:
+                if any(item["url"] == url for item, _ in top):
+                    continue
+                best = next((pair for pair in ranked if pair[0]["url"] == url), None)
+                if best:
+                    extras.append(best)
+            if extras:
+                top = top[: max(config["linked_top_k"] - len(extras), 0)] + extras
+            excerpts = "\n\n".join(f"[{item['url']}]\n{chunk}" for item, chunk in top)
+            blocks.append("Most relevant excerpts from the linked pages:\n\n" + excerpts)
     return "\n\n".join(blocks), failed
 
 
@@ -1951,22 +2183,55 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
         # URLs pasted into the message are fetched directly — search engines
         # don't index small sites, so searching for them finds nothing.
         have_linked_pages = False
+        restrict_to_linked = False
         urls = extract_urls(query) if mode else []
         if urls:
             plural = "s" if len(urls) > 1 else ""
             yield f"data: {json.dumps({'status': f'🔗 Reading {len(urls)} linked page{plural}…'})}\n\n"
-            page_block, failed = linked_pages_context(query, urls)
+            restrict_to_linked, crawl_site = classify_linked_usage(request.model, query)
+            # A bare domain root rarely answers anything by itself — explore
+            # the site regardless of how the classifier read the message.
+            if all(urlsplit(u).path in ("", "/") and not urlsplit(u).query for u in urls):
+                crawl_site = True
+            if crawl_site:
+                status = (f"🔗 Exploring {urlsplit(urls[0]).netloc} "
+                          f"(up to {web_config['crawl_max_pages']} pages)…")
+                yield f"data: {json.dumps({'status': status})}\n\n"
+            page_block, failed = linked_pages_context(query, urls, crawl_site)
             if failed:
                 notice = "Could not read: " + ", ".join(failed)
                 yield f"data: {json.dumps({'notice': notice})}\n\n"
             if page_block:
                 have_linked_pages = True
                 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                preamble = (
-                    f"Content fetched {today} (UTC) from the pages linked in "
-                    "the user's message. Use it to answer and cite the pages "
-                    "as markdown links.\n\n" + page_block + "\n\n")
+                if restrict_to_linked:
+                    preamble = (
+                        f"Content fetched {today} (UTC) from the pages linked "
+                        "in the user's message. The user asked to use only "
+                        "these pages as sources: answer strictly from this "
+                        "content, cite the pages as markdown links, and when "
+                        "the content does not cover something, say so instead "
+                        "of drawing on other sources or prior knowledge.\n\n"
+                        + page_block + "\n\n")
+                else:
+                    preamble = (
+                        f"Content fetched {today} (UTC) from the pages linked in "
+                        "the user's message. Use it to answer and cite the pages "
+                        "as markdown links.\n\n" + page_block + "\n\n")
                 outgoing = prepend_to_last_user_turn(outgoing, preamble)
+        only_hosts: list[str] = []
+        if restrict_to_linked:
+            if have_linked_pages:
+                # The user asked for the linked pages to be the only sources —
+                # honor it by skipping the engine search entirely.
+                yield f"data: {json.dumps({'status': '🔒 Using only the linked pages as sources…'})}\n\n"
+                mode = None
+            else:
+                # The sites couldn't be read directly; a search restricted to
+                # their domains is the closest available honoring of the request.
+                only_hosts = list(dict.fromkeys(
+                    h for h in (_host_of(u) for u in urls) if h))
+                mode = "search"
         search_query = None
         if mode == "search":
             search_query = query
@@ -1977,6 +2242,11 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                 search_query = rewrite_search_query(request.model, outgoing, query)
                 if search_query != query:
                     logger.info("Search query rewritten: %r", search_query)
+            if only_hosts:
+                # Engines don't reliably parse multiple site: operators; hint
+                # with the first host and let web_search_context's host filter
+                # enforce the full restriction.
+                search_query = f"site:{only_hosts[0]} {search_query}"
         if request.doc_ids:
             outgoing = apply_rag(outgoing, request.doc_ids)
         if mode == "search":
@@ -1984,7 +2254,9 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                          if web_config["fetch_pages"] else "🌐 Searching the web…")
             yield f"data: {json.dumps({'status': searching})}\n\n"
             try:
-                outgoing = apply_web_search(outgoing, search_query)
+                outgoing = apply_web_search(outgoing, search_query,
+                                            set(only_hosts) or None,
+                                            supplementary=have_linked_pages)
             except WebSearchError as exc:
                 # Degrade gracefully: surface the failure as a toast and let
                 # the model answer from its own knowledge. When the message's
@@ -2008,12 +2280,17 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                 yield f"data: {json.dumps({'status': status})}\n\n"
             if research_block:
                 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                precedence = (
+                    " The pages the user linked (provided separately) are the "
+                    "primary sources; these findings supplement them."
+                    if have_linked_pages else "")
                 preamble = (
                     f"Research findings retrieved {today} (UTC) by a "
                     "multi-query web search. Write a thorough, well-structured "
                     "answer from them: use headings where helpful, cite "
                     "sources inline as markdown links, and note anything the "
-                    "findings leave open.\n\n" + research_block + "\n\n")
+                    "findings leave open." + precedence + "\n\n"
+                    + research_block + "\n\n")
                 outgoing = prepend_to_last_user_turn(outgoing, preamble)
             elif not have_linked_pages:
                 notice = "Web research found no usable sources. Answering without web results."
