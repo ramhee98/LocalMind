@@ -45,8 +45,13 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from concurrent.futures import as_completed
 from contextlib import closing
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -130,6 +135,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # deliberately absent: it returns fuzzy keyword matches that poison
         # the context (e.g. beer-company pages for an "Asahi Linux" query).
         "backends": "duckduckgo, mojeek, brave",
+        # Search region/language as "country-language" (DuckDuckGo format,
+        # e.g. "ch-de", "de-de", "us-en"). Also sets the Accept-Language for
+        # page fetches and the SearXNG language. "wt-wt" = no region.
+        "region": "wt-wt",
         "max_results": 5,
         "timeout_seconds": 15,
         # Distill the conversation into a search query with the chat model
@@ -149,6 +158,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "crawl_max_pages": 8,
         # How many ranked excerpts from linked/crawled pages to inject.
         "linked_top_k": 10,
+        # Fetched pages are reused for this long, so follow-up questions
+        # about the same site don't re-download it every turn. 0 disables.
+        "page_cache_ttl_seconds": 900,
         # Research mode: the question is decomposed into sub-queries, each is
         # searched and read, then the model reviews what was found and
         # proposes follow-up queries for the gaps — repeated up to
@@ -831,6 +843,8 @@ def chunk_text(text: str, size: int, overlap: int) -> list[str]:
     chunks: list[str] = []
     start = 0
     length = len(text)
+    # Overlap must stay below the window or chunks wouldn't advance.
+    overlap = max(0, min(overlap, size - 1))
     step = max(1, size - overlap)
     while start < length:
         end = min(start + size, length)
@@ -842,9 +856,10 @@ def chunk_text(text: str, size: int, overlap: int) -> list[str]:
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-        if end <= start:
+        if end >= length or end <= start:
             break
-        start = end if end > start + step else start + step
+        # Step back by the overlap, but always advance by at least `step`.
+        start = max(end - overlap, start + step)
     return chunks
 
 
@@ -885,19 +900,37 @@ def ensure_embedding_model_loaded() -> None:
                        model, exc)
 
 
+# Embedding cache (text -> vector): follow-up questions about a pasted site
+# re-rank largely the same page chunks every turn, and re-embedding them is
+# the slowest part of an otherwise cache-served crawl. FIFO-evicted.
+EMBED_CACHE_MAX_ENTRIES = 2048
+_embed_cache: dict[str, list[float]] = {}
+_embed_cache_lock = threading.Lock()
+
+
 def embed_texts(inputs: list[str]) -> Optional[list[list[float]]]:
     """Embed inputs via LM Studio; returns None if the embedding API fails."""
-    # The /v1/embeddings endpoint can't set a TTL, so when the model isn't loaded
-    # yet, pre-load it via `lms` with the configured default TTL — otherwise a
-    # file upload would leave the embedding model resident with no idle timeout.
-    ensure_embedding_model_loaded()
-    try:
-        response = client.embeddings.create(
-            model=CONFIG["rag"]["embedding_model"], input=inputs)
-    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
-        logger.warning("Embedding request failed: %s", getattr(exc, "message", exc))
-        return None
-    return [item.embedding for item in response.data]
+    with _embed_cache_lock:
+        vectors = {text: _embed_cache[text] for text in inputs if text in _embed_cache}
+    missing = list(dict.fromkeys(text for text in inputs if text not in vectors))
+    if missing:
+        # The /v1/embeddings endpoint can't set a TTL, so when the model isn't
+        # loaded yet, pre-load it via `lms` with the configured default TTL —
+        # otherwise this request would leave it resident with no idle timeout.
+        ensure_embedding_model_loaded()
+        try:
+            response = client.embeddings.create(
+                model=CONFIG["rag"]["embedding_model"], input=missing)
+        except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+            logger.warning("Embedding request failed: %s", getattr(exc, "message", exc))
+            return None
+        vectors.update(zip(missing, (item.embedding for item in response.data)))
+        with _embed_cache_lock:
+            for text in missing:
+                _embed_cache[text] = vectors[text]
+            while len(_embed_cache) > EMBED_CACHE_MAX_ENTRIES:
+                _embed_cache.pop(next(iter(_embed_cache)))
+    return [vectors[text] for text in inputs]
 
 
 def index_document(filename: str, text: str, pages: Optional[int]) -> Optional[dict[str, Any]]:
@@ -1453,15 +1486,20 @@ def search_duckduckgo(query: str, max_results: int) -> list[dict[str, str]]:
     raw = None
     last_error: Optional[Exception] = None
     # ddgs rotates between backends, some of which fail transiently; one
-    # retry picks a different backend and resolves most hiccups.
+    # retry picks a different backend and resolves most hiccups. A slow
+    # failure was a timeout, not a hiccup — retrying would double the stall.
     for _ in range(2):
+        started = time.monotonic()
         try:
             with DDGS(timeout=CONFIG["web_search"]["timeout_seconds"]) as ddgs:
                 raw = ddgs.text(query, max_results=max_results,
-                                backend=CONFIG["web_search"]["backends"])
+                                backend=CONFIG["web_search"]["backends"],
+                                region=CONFIG["web_search"]["region"])
             break
         except Exception as exc:  # noqa: BLE001 — ddgs raises library-specific errors
             last_error = exc
+            if time.monotonic() - started > 5:
+                break
     if raw is None:
         raise WebSearchError(f"DuckDuckGo search failed: {last_error}") from last_error
     return [
@@ -1479,10 +1517,14 @@ def search_searxng(query: str, max_results: int) -> list[dict[str, str]]:
     base_url = (CONFIG["web_search"]["searxng_base_url"] or "").rstrip("/")
     if not base_url:
         raise WebSearchError("searxng_base_url is not configured")
+    params = {"q": query, "format": "json"}
+    language = _region_language()
+    if language:
+        params["language"] = language
     try:
         response = httpx.get(
             f"{base_url}/search",
-            params={"q": query, "format": "json"},
+            params=params,
             timeout=CONFIG["web_search"]["timeout_seconds"],
         )
         response.raise_for_status()
@@ -1499,10 +1541,10 @@ def search_searxng(query: str, max_results: int) -> list[dict[str, str]]:
     ]
 
 
-def run_web_search(query: str) -> list[dict[str, str]]:
+def run_web_search(query: str, max_results: Optional[int] = None) -> list[dict[str, str]]:
     """Dispatch to the configured search provider."""
     provider = CONFIG["web_search"]["provider"]
-    max_results = CONFIG["web_search"]["max_results"]
+    max_results = max_results or CONFIG["web_search"]["max_results"]
     if provider == "searxng":
         return search_searxng(query, max_results)
     if provider == "duckduckgo":
@@ -1515,8 +1557,10 @@ SEARCH_QUERY_SYSTEM_PROMPT = (
     "write one concise search query (a few keywords, no quotes, no boolean "
     "operators) that would find the information needed to answer the user's "
     "last message. Resolve pronouns and follow-up references from the "
-    "conversation so the query stands on its own. Reply with the query text "
-    "only — no explanations."
+    "conversation so the query stands on its own. Write the query in the "
+    "language of the user's question (English is fine for technical topics). "
+    "If the question is time-sensitive and names no date, include the "
+    "current year. Reply with the query text only — no explanations."
 )
 
 
@@ -1564,7 +1608,11 @@ def rewrite_search_query(model: str, messages: list[dict[str, Any]], fallback: s
             continue
         # Keep the tail: attachment text is prepended, the question comes last.
         lines.append(f"{message['role']}: {text[-800:]}")
-    text = quick_completion(model, SEARCH_QUERY_SYSTEM_PROMPT, "\n\n".join(lines),
+    # Helpers don't know the date; without it, "latest X" queries get the
+    # model's training-era year appended and steer the engine to stale pages.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    text = quick_completion(model, SEARCH_QUERY_SYSTEM_PROMPT,
+                            f"Today is {today}.\n\n" + "\n\n".join(lines),
                             max_tokens=200)
     text = " ".join(text.split()).strip("\"'") if text else ""
     if not text or len(text) > 200:
@@ -1573,125 +1621,261 @@ def rewrite_search_query(model: str, messages: list[dict[str, Any]], fallback: s
 
 
 class _PageTextExtractor(HTMLParser):
-    """Collect the readable text of an HTML page, plus the hrefs of its links.
+    """Collect the readable text of an HTML page, its <title>, and link hrefs.
 
-    Only reliably-closed non-content containers are skipped; boilerplate like
-    nav/footer text is left in because malformed pages often leave those tags
-    unclosed (which would swallow the whole document) — the embedding reranker
-    sorts low-value chunks out anyway.
+    Text fragments are buffered and joined into one line per block element,
+    so inline markup ("costs <b>5</b> francs") can't split sentences — split
+    sentences chunk poorly and embed worse. Only reliably-closed non-content
+    containers are skipped; boilerplate like nav/footer text is left in
+    because malformed pages often leave those tags unclosed (which would
+    swallow the whole document) — the reranker sorts low-value chunks out.
     """
 
     SKIP_TAGS = {"script", "style", "noscript", "svg", "template", "head"}
+    BLOCK_TAGS = {
+        "p", "div", "li", "ul", "ol", "br", "hr", "h1", "h2", "h3", "h4",
+        "h5", "h6", "tr", "td", "th", "table", "section", "article",
+        "header", "footer", "nav", "main", "aside", "blockquote", "pre",
+        "form", "figure", "figcaption", "details", "summary",
+    }
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._skip_depth = 0
+        self._in_title = False
+        self._buffer: list[str] = []
         self.parts: list[str] = []
         self.links: list[str] = []
+        self.title = ""
+
+    def _flush(self) -> None:
+        if self._buffer:
+            self.parts.append(" ".join(self._buffer))
+            self._buffer = []
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag == "title":
+            self._in_title = True
         if tag in self.SKIP_TAGS:
             self._skip_depth += 1
         elif tag == "a":
             for name, value in attrs:
                 if name == "href" and value:
                     self.links.append(value)
+        if tag in self.BLOCK_TAGS:
+            self._flush()
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
         if tag in self.SKIP_TAGS and self._skip_depth:
             self._skip_depth -= 1
+        if tag in self.BLOCK_TAGS:
+            self._flush()
 
     def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title += data
+            return
         if not self._skip_depth and data.strip():
-            self.parts.append(data.strip())
+            self._buffer.append(" ".join(data.split()))
+
+    def close(self) -> None:
+        super().close()
+        self._flush()
 
 
+def _region_language() -> str:
+    """The configured search region as an HTTP language tag ("de-CH"); "" if none."""
+    region = CONFIG["web_search"].get("region") or "wt-wt"
+    if region == "wt-wt" or "-" not in region:
+        return ""
+    country, _, language = region.partition("-")
+    return f"{language}-{country.upper()}"
+
+
+_LANGUAGE_TAG = _region_language()
 BROWSER_HEADERS = {
     # Some sites reject the default httpx user agent outright.
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/124.0 Safari/537.36"),
-    "Accept-Language": "en",
+    # Content-negotiating sites should serve the configured region's language.
+    "Accept-Language": (
+        f"{_LANGUAGE_TAG},{_LANGUAGE_TAG.split('-')[0]};q=0.9,en;q=0.8"
+        if _LANGUAGE_TAG else "en"),
 }
 
+# A pasted PDF link is read with the same pypdf path uploads use; this caps
+# how much of one is downloaded.
+MAX_PDF_BYTES = 20 * 1024 * 1024
 
-def fetch_page(url: str) -> tuple[str, list[str], str]:
-    """Fetch one page; returns (readable text, hrefs on it, final URL after redirects).
 
-    The body is streamed and capped so a link to a large download can't
-    exhaust memory; the cap leaves generous headroom for HTML markup around
-    max_page_chars of extractable text.
+# Fetched-page cache (url -> (timestamp, fetch_page result)): follow-up
+# questions about a pasted site re-crawl the same pages every turn; serving
+# them from a short-lived cache makes those turns near-instant. Successful
+# fetches only, so transient failures retry naturally.
+PAGE_CACHE_MAX_ENTRIES = 256
+_page_cache: dict[str, tuple[float, tuple[str, list[str], str, str]]] = {}
+_page_cache_lock = threading.Lock()
+
+
+def _fetch_pdf_text(response: httpx.Response, max_chars: int, deadline: float) -> str:
+    """Read a streamed PDF response (size- and time-bounded) and extract its text."""
+    data = bytearray()
+    if int(response.headers.get("content-length") or 0) > MAX_PDF_BYTES:
+        return ""
+    for piece in response.iter_bytes():
+        data.extend(piece)
+        # A byte-trickling server resets httpx's per-read timeout forever; the
+        # wall-clock deadline is what actually bounds the download.
+        if len(data) > MAX_PDF_BYTES or time.monotonic() > deadline:
+            return ""
+    extracted = extract_pdf_text(bytes(data))
+    if not isinstance(extracted, tuple):
+        return ""
+    return extracted[0][:max_chars]
+
+
+def fetch_page(url: str) -> tuple[str, list[str], str, str]:
+    """Fetch one page; returns (readable text, hrefs, final URL after redirects, title).
+
+    HTML bodies are streamed with both a size cap and a wall-clock deadline,
+    so a link to a large download or a byte-trickling server can't exhaust
+    memory or stall the batch; the size cap leaves generous headroom for
+    markup around max_page_chars of extractable text. PDF links are read via
+    the same pypdf path uploads use.
     """
     config = CONFIG["web_search"]
+    ttl = config["page_cache_ttl_seconds"]
+    if ttl:
+        with _page_cache_lock:
+            entry = _page_cache.get(url)
+            if entry and time.monotonic() - entry[0] < ttl:
+                return entry[1]
     parser = _PageTextExtractor()
+    started = time.monotonic()
+    timed_out = False
     with httpx.stream("GET", url, timeout=config["timeout_seconds"],
                       follow_redirects=True, headers=BROWSER_HEADERS) as response:
         response.raise_for_status()
         final_url = str(response.url)
-        if "html" not in response.headers.get("content-type", "html"):
-            return "", [], final_url
-        max_html_chars = config["max_page_chars"] * 20
-        read = 0
-        try:
-            for piece in response.iter_text():
-                parser.feed(piece)
-                read += len(piece)
-                if read >= max_html_chars:
-                    break
-            parser.close()
-        except Exception:  # noqa: BLE001 — never let a weird page kill the fetch
-            pass
-    return "\n".join(parser.parts)[: config["max_page_chars"]], parser.links, final_url
+        content_type = response.headers.get("content-type", "html")
+        if "pdf" in content_type or urlsplit(final_url).path.lower().endswith(".pdf"):
+            try:
+                text = _fetch_pdf_text(response, config["max_page_chars"],
+                                       started + config["timeout_seconds"])
+            except httpx.HTTPError:
+                text = ""
+            result = (text, [], final_url, "")
+        elif "html" not in content_type:
+            result = ("", [], final_url, "")
+        else:
+            max_html_chars = config["max_page_chars"] * 20
+            read = 0
+            try:
+                for piece in response.iter_text():
+                    parser.feed(piece)
+                    read += len(piece)
+                    if read >= max_html_chars:
+                        break
+                    if time.monotonic() - started > config["timeout_seconds"]:
+                        timed_out = True
+                        break
+                parser.close()
+            except Exception:  # noqa: BLE001 — never let a weird page kill the fetch
+                pass
+            title = " ".join(parser.title.split())[:200]
+            result = ("\n".join(parser.parts)[: config["max_page_chars"]],
+                      parser.links, final_url, title)
+    # Cache only successful, complete fetches: a deadline-truncated or empty
+    # result (size-capped PDF, JS shell, transient content-type miss) should
+    # be retried on the next turn, not served from cache for the whole TTL.
+    if ttl and not timed_out and result[0]:
+        with _page_cache_lock:
+            _page_cache[url] = (time.monotonic(), result)
+            while len(_page_cache) > PAGE_CACHE_MAX_ENTRIES:
+                _page_cache.pop(next(iter(_page_cache)))
+    return result
 
 
-def fetch_page_texts(results: list[dict[str, str]]) -> dict[str, str]:
-    """Download the result pages concurrently; failures are skipped."""
-    texts: dict[str, str] = {}
+def fetch_page_texts(results: list[dict[str, str]]) -> dict[str, tuple[str, str]]:
+    """Download the result pages concurrently; returns {url: (text, title)}.
+
+    Failures are skipped, and the whole batch is bounded by a deadline so one
+    slow page can't hold the answer hostage — whatever finished in time is
+    used. Stragglers keep downloading in the background and land in the page
+    cache for the next turn.
+    """
+    texts: dict[str, tuple[str, str]] = {}
     urls = [item["url"] for item in results if item["url"]]
-    with ThreadPoolExecutor(max_workers=min(5, len(urls) or 1)) as pool:
-        futures = {pool.submit(fetch_page, url): url for url in urls}
-        for future in as_completed(futures):
+    if not urls:
+        return texts
+    pool = ThreadPoolExecutor(max_workers=min(5, len(urls)))
+    futures = {pool.submit(fetch_page, url): url for url in urls}
+    try:
+        deadline = CONFIG["web_search"]["timeout_seconds"] + 5
+        for future in as_completed(futures, timeout=deadline):
             url = futures[future]
             try:
-                texts[url] = future.result()[0]
+                text, _, _, title = future.result()
+                texts[url] = (text, title)
             except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
                 logger.info("Skipping web result %s: %s", url, exc)
+    except FuturesTimeoutError:
+        # concurrent.futures.TimeoutError, a separate class from the builtin
+        # on Python 3.10 — catch it explicitly so the deadline degrades
+        # gracefully instead of escaping and aborting the whole answer.
+        logger.info("Page fetch deadline hit; continuing with %d of %d pages",
+                    len(texts), len(urls))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return texts
 
 
-def web_search_context(query: str, only_hosts: Optional[set[str]] = None) -> str:
+def web_search_context(
+    model: str, query: str, rank_query: str,
+    only_hosts: Optional[set[str]] = None,
+) -> str:
     """Search the web and build a context block for prompt injection.
 
-    With fetch_pages on, the top result pages are downloaded and their chunks
-    embed-ranked against the query (the RAG pipeline); when pages or the
-    embedding model are unavailable, the result snippets are used instead.
-    `only_hosts` drops results from other sites — engines don't always honor
-    a site: operator strictly, so the restriction is enforced here too.
+    The engine is asked for twice the configured results and a quick LLM
+    relevance check drops the off-topic ones (engines fuzzy-match keywords)
+    before any page is fetched. Page chunks are embed-ranked against
+    `rank_query` — the user's actual question — not the keyword query sent
+    to the engine. `only_hosts` drops results from other sites: engines
+    don't always honor a site: operator strictly, so it's enforced here too.
     """
-    results = run_web_search(query)
+    config = CONFIG["web_search"]
+    results = run_web_search(query, config["max_results"] * 2)
     if only_hosts:
         results = [item for item in results if _same_site(item["url"], only_hosts)]
+    if len(results) > config["max_results"]:
+        # A NONE verdict ([]) shouldn't wipe a successful search down to no
+        # context — keep the engine's own top results in that case.
+        results = filter_relevant_results(model, rank_query, results) or results
+    results = results[: config["max_results"]]
     if not results:
         return ""
     # The snippets always go in: for weather/news-style queries they often
     # carry the direct answer, while the pages behind them are JS shells
     # whose extracted text contains nothing useful.
     snippets = "Search results:\n\n" + "\n\n".join(
-        f"[{index}] {item['title']}\n{item['url']}\n{item['snippet']}"
+        f"[{index}] [{item['title']}]({item['url']})\n{item['snippet']}"
         for index, item in enumerate(results, 1)
     )
-    if not CONFIG["web_search"]["fetch_pages"]:
+    if not config["fetch_pages"]:
         return snippets
     page_texts = fetch_page_texts(results)
     rag = CONFIG["rag"]
     pool: list[tuple[dict[str, str], str]] = []
     for item in results:
-        text = page_texts.get(item["url"], "")
+        text = page_texts.get(item["url"], ("", ""))[0]
         for chunk in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"]):
             pool.append((item, chunk))
     if not pool:
         return snippets
-    top = rank_chunks_by_query(query, pool, CONFIG["web_search"]["top_k"])
+    top = rank_chunks_by_query(rank_query, pool, config["top_k"])
     if top is None:
         return snippets
     excerpts = "\n\n".join(
@@ -1699,10 +1883,10 @@ def web_search_context(query: str, only_hosts: Optional[set[str]] = None) -> str
     return snippets + "\n\nRelevant excerpts from the result pages:\n\n" + excerpts
 
 
-def rank_chunks_by_query(
-    query: str, pool: list[tuple[dict[str, str], str]], top_k: int
+def score_chunks_by_query(
+    query: str, pool: list[tuple[dict[str, str], str]]
 ) -> Optional[list[tuple[dict[str, str], str]]]:
-    """Embed-rank (result, chunk) pairs against the query; None if embeddings fail."""
+    """All (result, chunk) pairs sorted by similarity to the query; None if embeddings fail."""
     chunk_embeddings = embed_texts([f"search_document: {chunk}" for _, chunk in pool])
     query_embedding = embed_texts([f"search_query: {query}"]) if chunk_embeddings else None
     if not chunk_embeddings or not query_embedding:
@@ -1714,21 +1898,64 @@ def rank_chunks_by_query(
         key=lambda entry: _dot(q, entry[1]) / ((math.sqrt(_dot(entry[1], entry[1])) or 1.0) * qnorm),
         reverse=True,
     )
-    return [pair for pair, _ in scored[:top_k]]
+    return [pair for pair, _ in scored]
+
+
+def select_diverse_chunks(
+    ranked: list[tuple[dict[str, str], str]], top_k: int
+) -> list[tuple[dict[str, str], str]]:
+    """Greedy top_k from ranked, skipping near-duplicates of already-picked chunks.
+
+    Pages repeat taglines, teasers and shared boilerplate; without this the
+    top slots fill with copies of the same paragraph instead of new facts.
+    """
+    if top_k <= 0:
+        return []
+    selected: list[tuple[dict[str, str], str]] = []
+    picked_words: list[set[str]] = []
+    for item, chunk in ranked:
+        words = set(chunk.lower().split())
+        if words and any(
+                len(words & seen) / len(words | seen) > 0.8 for seen in picked_words):
+            continue
+        selected.append((item, chunk))
+        picked_words.append(words)
+        if len(selected) == top_k:
+            break
+    return selected
+
+
+def rank_chunks_by_query(
+    query: str, pool: list[tuple[dict[str, str], str]], top_k: int
+) -> Optional[list[tuple[dict[str, str], str]]]:
+    """Embed-rank (result, chunk) pairs against the query; None if embeddings fail."""
+    ranked = score_chunks_by_query(query, pool)
+    return None if ranked is None else select_diverse_chunks(ranked, top_k)
 
 
 def apply_web_search(
-    messages: list[dict[str, Any]], query: str,
+    messages: list[dict[str, Any]], model: str, query: str, user_query: str,
     only_hosts: Optional[set[str]] = None, supplementary: bool = False,
+    fallback_query: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Prepend web search results for `query` to the final user turn.
 
-    `query` is passed explicitly because RAG may already have prepended
-    document context to the message by this point. `supplementary` marks the
-    results as secondary to pages the user linked themselves.
+    `user_query` is the user's actual question (used to judge relevance and
+    rank page chunks); it is passed explicitly because RAG may already have
+    prepended document context to the message. `supplementary` marks the
+    results as secondary to pages the user linked themselves. When the query
+    finds nothing and a `fallback_query` is given, that is searched once —
+    an over-specific rewrite or an unsupported site: operator shouldn't kill
+    the whole search.
     """
+    # Pasted URLs and instruction words are noise for relevance judgments.
+    rank_query = " ".join(URL_PATTERN.sub(" ", user_query).split()) or user_query
     # Search engines cap query length; the first sentences carry the intent.
-    context = web_search_context(query[:400], only_hosts)
+    context = web_search_context(model, query[:400], rank_query, only_hosts)
+    if not context and fallback_query and fallback_query.strip() != query.strip():
+        logger.info("Search found nothing for %r; retrying with %r",
+                    query, fallback_query)
+        context = web_search_context(model, fallback_query[:400], rank_query, only_hosts)
     if not context:
         return messages
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1840,8 +2067,8 @@ def collect_site_links(page_url: str, hrefs: list[str], hosts: set[str]) -> list
     return links
 
 
-def crawl_site_texts(start_urls: list[str], max_pages: int) -> dict[str, str]:
-    """Fetch the pasted pages plus same-site links, breadth-first, up to max_pages.
+def crawl_site_texts(start_urls: list[str], max_pages: int) -> dict[str, tuple[str, str]]:
+    """Crawl pasted pages + same-site links breadth-first; {url: (text, title)}.
 
     A single linked page rarely answers questions about a site as a whole —
     the "what is this podcast about?" answer lives on /about or the episode
@@ -1850,7 +2077,7 @@ def crawl_site_texts(start_urls: list[str], max_pages: int) -> dict[str, str]:
     hosts = {h for h in (_host_of(url) for url in start_urls) if h}
     seen = {crawl_dedup_key(url) for url in start_urls}
     frontier = list(start_urls)
-    texts: dict[str, str] = {}
+    texts: dict[str, tuple[str, str]] = {}
     attempts = 0
     # Only pages that yielded text fill the page budget; the attempts cap
     # bounds the crawl when many links error out or turn out not to be HTML.
@@ -1863,7 +2090,7 @@ def crawl_site_texts(start_urls: list[str], max_pages: int) -> dict[str, str]:
             for future in as_completed(futures):
                 url = futures[future]
                 try:
-                    text, hrefs, final_url = future.result()
+                    text, hrefs, final_url, title = future.result()
                 except Exception as exc:  # noqa: BLE001 — a weird link must not kill the crawl
                     logger.info("Skipping crawled page %s: %s", url, exc)
                     continue
@@ -1879,7 +2106,7 @@ def crawl_site_texts(start_urls: list[str], max_pages: int) -> dict[str, str]:
                     continue
                 seen.add(crawl_dedup_key(final_url))
                 if text:
-                    texts[url] = text
+                    texts[url] = (text, title)
                 # Resolve hrefs against the final URL: after a redirect (say
                 # /blog -> /blog/), relative links are wrong otherwise.
                 for link in collect_site_links(final_url, hrefs, hosts):
@@ -1936,6 +2163,38 @@ def classify_linked_usage(model: str, query: str) -> tuple[bool, bool]:
     return restrict, restrict or (depth is not None and depth.group(1) == "SITE")
 
 
+def strip_repeated_lines(
+    texts: dict[str, tuple[str, str]]
+) -> dict[str, tuple[str, str]]:
+    """Collapse site furniture across crawled pages of one site.
+
+    Nav menus, footers and player controls repeat on most pages; the first
+    page keeps one copy (it may carry signal — a tagline, the site name) and
+    the rest drop it, so the chunk pool isn't crowded with duplicates.
+    """
+    if len(texts) < 4:
+        return texts
+    threshold = len(texts) // 2 + 1
+    counts: Counter[str] = Counter()
+    for text, _ in texts.values():
+        counts.update(set(text.splitlines()))
+    repeated = {line for line, count in counts.items() if count >= threshold}
+    if not repeated:
+        return texts
+    kept_once: set[str] = set()
+    cleaned: dict[str, tuple[str, str]] = {}
+    for url, (text, title) in texts.items():
+        lines = []
+        for line in text.splitlines():
+            if line in repeated:
+                if line in kept_once:
+                    continue
+                kept_once.add(line)
+            lines.append(line)
+        cleaned[url] = ("\n".join(lines), title)
+    return cleaned
+
+
 def linked_pages_context(query: str, urls: list[str], crawl: bool) -> tuple[str, list[str]]:
     """Fetch user-pasted URLs; returns (context block, pasted URLs that failed).
 
@@ -1949,36 +2208,47 @@ def linked_pages_context(query: str, urls: list[str], crawl: bool) -> tuple[str,
     rag = CONFIG["rag"]
     if crawl:
         texts = crawl_site_texts(urls, max(len(urls), int(config["crawl_max_pages"])))
+        texts = strip_repeated_lines(texts)
     else:
         texts = fetch_page_texts([{"title": url, "url": url, "snippet": ""} for url in urls])
-    failed = [url for url in urls if not texts.get(url)]
+    failed = [url for url in urls if not texts.get(url, ("", ""))[0]]
+
+    def label(url: str) -> str:
+        # A real <title> makes a better citation link than a bare URL, which
+        # for a crawled /episode-417 says nothing about the content.
+        title = texts.get(url, ("", ""))[1]
+        return f"[{title}]({url})" if title else f"[{url}]"
+
     blocks: list[str] = []
     pool: list[tuple[dict[str, str], str]] = []
     overflow: list[str] = []  # pasted pages too long to inline
     for url in urls:
-        text = texts.get(url, "")
+        text = texts.get(url, ("", ""))[0]
         if not text:
             continue
         if len(text) <= LINKED_PAGE_INLINE_CHARS:
-            blocks.append(f"[{url}]\n{text}")
+            blocks.append(f"{label(url)}\n{text}")
         else:
             overflow.append(url)
-            pool.extend(({"url": url}, chunk) for chunk
+            pool.extend(({"url": url, "label": label(url)}, chunk) for chunk
                         in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"]))
-    for url, text in texts.items():
+    for url, (text, _) in texts.items():
         if url in urls or not text:
             continue
-        pool.extend(({"url": url}, chunk) for chunk
+        pool.extend(({"url": url, "label": label(url)}, chunk) for chunk
                     in chunk_text(text, rag["chunk_chars"], rag["chunk_overlap"]))
     if pool:
         capped = pool[:RESEARCH_POOL_CAP]
-        ranked = rank_chunks_by_query(query, capped, len(capped))
+        # The pasted URLs and instruction words ("use no other source") are
+        # noise for similarity ranking; the topical words should match.
+        rank_query = " ".join(URL_PATTERN.sub(" ", query).split()) or query
+        ranked = score_chunks_by_query(rank_query, capped)
         if ranked is None:
             # No embeddings: keep the lead of the long pasted pages, as before.
-            blocks.extend(f"[{url}]\n{texts[url][:LINKED_PAGE_INLINE_CHARS]}"
+            blocks.extend(f"{label(url)}\n{texts[url][0][:LINKED_PAGE_INLINE_CHARS]}"
                           for url in overflow)
         else:
-            top = ranked[: config["linked_top_k"]]
+            top = select_diverse_chunks(ranked, config["linked_top_k"])
             # Every page the user pasted deserves representation — don't let
             # one long page crowd the others out of the excerpt slots.
             extras = []
@@ -1990,7 +2260,7 @@ def linked_pages_context(query: str, urls: list[str], crawl: bool) -> tuple[str,
                     extras.append(best)
             if extras:
                 top = top[: max(config["linked_top_k"] - len(extras), 0)] + extras
-            excerpts = "\n\n".join(f"[{item['url']}]\n{chunk}" for item, chunk in top)
+            excerpts = "\n\n".join(f"{item['label']}\n{chunk}" for item, chunk in top)
             blocks.append("Most relevant excerpts from the linked pages:\n\n" + excerpts)
     return "\n\n".join(blocks), failed
 
@@ -2000,8 +2270,9 @@ def linked_pages_context(query: str, urls: list[str], crawl: bool) -> tuple[str,
 RESEARCH_PLAN_SYSTEM_PROMPT = (
     "You are a research planner. Given a question, reply with the distinct web "
     "search queries (each a few keywords) that together cover what is needed "
-    "to answer it thoroughly. One query per line — no numbering, no "
-    "explanations."
+    "to answer it thoroughly. Write queries in the question's language "
+    "(English is fine for technical topics). One query per line — no "
+    "numbering, no explanations."
 )
 
 RESEARCH_REFLECT_SYSTEM_PROMPT = (
@@ -2042,9 +2313,11 @@ def parse_query_lines(text: str, limit: int) -> list[str]:
 
 def plan_research_queries(model: str, query: str, limit: int) -> list[str]:
     """Decompose the question into sub-queries; the raw question on failure."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     text = quick_completion(
         model, RESEARCH_PLAN_SYSTEM_PROMPT,
-        f"Question: {query}\n\nReply with at most {limit} queries.")
+        f"Today is {today}.\nQuestion: {query}\n\n"
+        f"Reply with at most {limit} queries.")
     return parse_query_lines(text or "", limit) or [query[:400]]
 
 
@@ -2085,9 +2358,11 @@ def reflect_research_gaps(
     """Ask the model which follow-up queries would fill gaps; [] means stop."""
     sources = "\n".join(
         f"- {item['title']}: {item['snippet'][:150]}" for item in results[:25])
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     text = quick_completion(
         model, RESEARCH_REFLECT_SYSTEM_PROMPT,
-        f"Question: {query}\n\nSources collected so far:\n{sources}\n\n"
+        f"Today is {today}.\nQuestion: {query}\n\n"
+        f"Sources collected so far:\n{sources}\n\n"
         f"Reply with at most {limit} queries, or DONE.")
     if not text or text.strip().upper().startswith("DONE"):
         return []
@@ -2118,9 +2393,17 @@ def research_context(model: str, query: str) -> Iterator[str]:
         round_results: list[dict[str, str]] = []
         for sub_query in queries:
             seen_queries.add(sub_query.lower())
-            yield f"🔬 Round {round_no}/{max_rounds}: searching “{sub_query}”…"
+        listing = ", ".join(f"“{q}”" for q in queries)
+        yield f"🔬 Round {round_no}/{max_rounds}: searching {listing}…"
+        # The sub-queries are independent — search them concurrently (the
+        # executor exit joins them; results merge in query order so the URL
+        # dedup stays deterministic).
+        with ThreadPoolExecutor(max_workers=min(3, len(queries))) as search_pool:
+            searches = [(q, search_pool.submit(run_web_search, q[:400]))
+                        for q in queries]
+        for sub_query, search in searches:
             try:
-                found = run_web_search(sub_query[:400])
+                found = search.result()
             except WebSearchError as exc:
                 logger.warning("Research query %r failed: %s", sub_query, exc)
                 continue
@@ -2141,7 +2424,7 @@ def research_context(model: str, query: str) -> Iterator[str]:
             yield f"🔬 Round {round_no}/{max_rounds}: reading {len(round_results)} pages…"
             texts = fetch_page_texts(round_results)
             for item in round_results:
-                for chunk in chunk_text(texts.get(item["url"], ""),
+                for chunk in chunk_text(texts.get(item["url"], ("", ""))[0],
                                         rag["chunk_chars"], rag["chunk_overlap"]):
                     pool.append((item, chunk))
             if len(pool) >= RESEARCH_POOL_CAP:
@@ -2154,7 +2437,7 @@ def research_context(model: str, query: str) -> Iterator[str]:
     # The snippet list doubles as the source index for citations; cap it so a
     # large rounds × results configuration can't flood the prompt.
     snippets = "Search results:\n\n" + "\n\n".join(
-        f"[{index}] {item['title']}\n{item['url']}\n{item['snippet']}"
+        f"[{index}] [{item['title']}]({item['url']})\n{item['snippet']}"
         for index, item in enumerate(results_found[:15], 1))
     if not pool:
         return snippets
@@ -2188,7 +2471,16 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
         if urls:
             plural = "s" if len(urls) > 1 else ""
             yield f"data: {json.dumps({'status': f'🔗 Reading {len(urls)} linked page{plural}…'})}\n\n"
-            restrict_to_linked, crawl_site = classify_linked_usage(request.model, query)
+            if web_config["page_cache_ttl_seconds"]:
+                # The pasted pages are needed whatever the classifier decides —
+                # warm the page cache while it runs instead of after.
+                with ThreadPoolExecutor(max_workers=2) as overlap:
+                    verdict = overlap.submit(classify_linked_usage, request.model, query)
+                    overlap.submit(fetch_page_texts,
+                                   [{"title": u, "url": u, "snippet": ""} for u in urls])
+                    restrict_to_linked, crawl_site = verdict.result()
+            else:
+                restrict_to_linked, crawl_site = classify_linked_usage(request.model, query)
             # A bare domain root rarely answers anything by itself — explore
             # the site regardless of how the classifier read the message.
             if all(urlsplit(u).path in ("", "/") and not urlsplit(u).query for u in urls):
@@ -2233,8 +2525,13 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
                     h for h in (_host_of(u) for u in urls) if h))
                 mode = "search"
         search_query = None
+        fallback_query = None
         if mode == "search":
             search_query = query
+            # The raw question (minus any pasted URL) is the last-resort query
+            # when an over-specific rewrite or a site: operator finds nothing.
+            clean_question = " ".join(URL_PATTERN.sub(" ", query).split()) or query
+            fallback_query = clean_question
             if web_config["rewrite_query"]:
                 yield f"data: {json.dumps({'status': '🌐 Preparing web search…'})}\n\n"
                 # Rewrite from the pre-RAG messages so retrieved document
@@ -2245,27 +2542,45 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
             if only_hosts:
                 # Engines don't reliably parse multiple site: operators; hint
                 # with the first host and let web_search_context's host filter
-                # enforce the full restriction.
+                # enforce the full restriction. site: support is flaky on small
+                # sites, so the fallback searches the host as a plain keyword.
                 search_query = f"site:{only_hosts[0]} {search_query}"
+                fallback_query = f"{only_hosts[0]} {clean_question}"
         if request.doc_ids:
             outgoing = apply_rag(outgoing, request.doc_ids)
         if mode == "search":
             searching = ("🌐 Searching the web & reading the top results…"
                          if web_config["fetch_pages"] else "🌐 Searching the web…")
             yield f"data: {json.dumps({'status': searching})}\n\n"
+            before_search = outgoing
             try:
-                outgoing = apply_web_search(outgoing, search_query,
-                                            set(only_hosts) or None,
-                                            supplementary=have_linked_pages)
+                outgoing = apply_web_search(
+                    outgoing, request.model, search_query, query,
+                    set(only_hosts) or None, supplementary=have_linked_pages,
+                    fallback_query=fallback_query)
             except WebSearchError as exc:
                 # Degrade gracefully: surface the failure as a toast and let
                 # the model answer from its own knowledge. When the message's
                 # linked pages were already fetched, a failed search on top of
                 # them is routine (tiny sites aren't indexed) — log only.
                 logger.warning("Web search failed: %s", exc)
-                if not have_linked_pages:
+                # The honesty preamble below speaks for the restricted case;
+                # a "answering without web results" toast would contradict it.
+                if not have_linked_pages and not only_hosts:
                     notice = f"Web search failed — {exc}. Answering without web results."
                     yield f"data: {json.dumps({'notice': notice})}\n\n"
+            if only_hosts and outgoing is before_search:
+                # A source restriction the pipeline couldn't satisfy: the
+                # linked sites were unreadable AND the restricted search found
+                # nothing. Tell the model rather than let it silently answer
+                # from prior knowledge, which the restriction forbids.
+                preamble = (
+                    "The user restricted sources to "
+                    f"{', '.join(urls)}, but those pages could not be "
+                    "retrieved and a search restricted to them found nothing. "
+                    "Tell the user the requested sources are unavailable; do "
+                    "not answer from other sources or prior knowledge.\n\n")
+                outgoing = prepend_to_last_user_turn(outgoing, preamble)
         elif mode == "research":
             # Drain the research generator, forwarding its progress statuses;
             # its return value is the assembled context block.
