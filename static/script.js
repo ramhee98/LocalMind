@@ -77,6 +77,8 @@
   let imageMode = false;
   let imageGenSupported = false;
   let imageGenDetail = "";
+  /** Whether the server can synthesize speech (Kokoro installed + enabled). */
+  let ttsEnabled = false;
   /** Uploaded documents waiting to be sent with the next message. */
   let attachments = [];
   let attachmentCounter = 0;
@@ -160,6 +162,9 @@
         webModeSelect.parentElement.classList.add("hidden");
         webModeSelect.value = "";
       }
+      // Gates the per-message speaker button; stays false when Kokoro is
+      // unavailable so we don't show a control that always fails.
+      ttsEnabled = Boolean(data.tts?.enabled);
       const defaultSize = data.image_generation?.default_size;
       if (defaultSize) {
         if (![...imageSizeSelect.options].some((o) => o.value === defaultSize)) {
@@ -1198,6 +1203,8 @@
   // ---------- Conversations (server-side persistence) ----------
 
   function clearChatWindow() {
+    // Stop any in-flight narration so it doesn't outlive its (removed) message.
+    ttsPlayer.stop();
     chatWindow.querySelectorAll(".message").forEach((node) => node.remove());
   }
 
@@ -1475,6 +1482,194 @@
     chatWindow.scrollTop = chatWindow.scrollHeight;
   }
 
+  // ---------- Text-to-speech (Web Audio API streaming playback) ----------
+  //
+  // /api/tts streams raw little-endian float32 PCM (mono) as Kokoro renders
+  // each sentence. We decode nothing: every network chunk is sliced to whole
+  // float samples, wrapped in an AudioBuffer, and scheduled back-to-back on a
+  // running cursor, so playback starts on the first sentence and stays gapless
+  // even though later sentences are still synthesizing on the server.
+
+  /**
+   * Reduce Markdown to plain-ish text so the voice doesn't read syntax aloud
+   * (code fences, **bold**, link URLs, list bullets). A light pass — good
+   * enough for speech, not a real parser.
+   */
+  function speechText(raw) {
+    if (!raw) return "";
+    return raw
+      .replace(/```[\s\S]*?```/g, " ")          // fenced code blocks
+      .replace(/`([^`]+)`/g, "$1")               // inline code
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")      // images
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")    // links -> visible text
+      .replace(/^\s{0,3}#{1,6}\s+/gm, "")         // ATX headings
+      .replace(/^\s{0,3}>\s?/gm, "")              // blockquotes
+      .replace(/^\s*[-*+]\s+/gm, "")              // bullet markers
+      .replace(/(\*\*|__|\*|_|~~)/g, "")          // emphasis markers
+      .replace(/\|/g, " ")                        // table pipes
+      .replace(/\n{2,}/g, ". ")                   // paragraph break -> pause
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  const ttsPlayer = {
+    ctx: null,
+    controller: null,        // identifies the active run AND aborts its fetch
+    sources: new Set(),      // scheduled AudioBufferSourceNodes still to play
+    nextStartTime: 0,        // AudioContext-clock cursor for gapless scheduling
+    button: null,            // the speaker button driving current playback
+    streaming: false,        // true while audio bytes are still arriving
+    sampleRate: 24000,
+    leadIn: 0.15,            // small jitter buffer before the first chunk plays
+
+    /** The speaker button is a play/stop toggle scoped to one message. */
+    async toggle(text, button) {
+      // Second click on the active button stops it.
+      if (this.button === button && (this.streaming || this.sources.size)) {
+        this.stop();
+        return;
+      }
+      this.stop(); // starting a new message stops whatever was playing
+      if (!text || !text.trim()) {
+        toast("Nothing to read aloud.", "error");
+        return;
+      }
+      // The controller is this run's identity token: any async continuation
+      // below only touches shared state while `this.controller === controller`,
+      // so a superseded run (the user clicked another message) can't tear down
+      // the playback that replaced it.
+      const controller = new AbortController();
+      this.controller = controller;
+      this.button = button;
+      this._setButton(button, "loading");
+      try {
+        await this._stream(text, controller);
+      } catch (error) {
+        if (this.controller !== controller) return; // a newer run owns us now
+        if (error.name !== "AbortError") {
+          toast(error.message || "Text-to-speech failed.", "error", 6000);
+        }
+        this.stop();
+      }
+    },
+
+    async _stream(text, controller) {
+      // An AudioContext must be created/resumed from the click gesture.
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error("This browser has no Web Audio API support.");
+      const ctx = new Ctx();
+      this.ctx = ctx;
+      this.streaming = true;
+      this.nextStartTime = 0;
+      await ctx.resume();
+      // Bail (closing our own context) if a newer run superseded us.
+      if (this.controller !== controller) {
+        if (ctx.state !== "closed") ctx.close().catch(() => {});
+        return;
+      }
+
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+        signal: controller.signal,
+      });
+      if (this.controller !== controller) return;
+      if (!response.ok || !response.body) {
+        let detail = `Text-to-speech failed (status ${response.status}).`;
+        try { detail = (await response.json()).error || detail; } catch { /* keep */ }
+        throw new Error(detail);
+      }
+      this.sampleRate = Number(response.headers.get("X-Sample-Rate")) || 24000;
+
+      const reader = response.body.getReader();
+      let leftover = new Uint8Array(0); // bytes that didn't complete a float
+      let scheduled = false;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (this.controller !== controller) return; // superseded mid-stream
+        let bytes = value;
+        if (leftover.length) {
+          const merged = new Uint8Array(leftover.length + value.length);
+          merged.set(leftover);
+          merged.set(value, leftover.length);
+          bytes = merged;
+        }
+        const usable = bytes.length - (bytes.length % 4); // float32 = 4 bytes
+        leftover = bytes.slice(usable); // copy; the read buffer may be reused
+        if (usable > 0) { this._schedule(this._toFloat32(bytes, usable)); scheduled = true; }
+      }
+      if (this.controller !== controller) return;
+      this.streaming = false;
+      // Nothing played at all (e.g. server produced no audio): clean up and say so.
+      if (!scheduled && !this.sources.size) {
+        this.stop();
+        toast("No speech was generated for this message.", "error");
+        return;
+      }
+      // If everything already finished playing, settle the button now;
+      // otherwise the last source's onended handler will.
+      if (!this.sources.size && this.button) this._setButton(this.button, "idle");
+    },
+
+    /** Copy `length` bytes into an aligned Float32Array (LE; all browsers). */
+    _toFloat32(bytes, length) {
+      const aligned = new ArrayBuffer(length);
+      new Uint8Array(aligned).set(bytes.subarray(0, length));
+      return new Float32Array(aligned);
+    },
+
+    _schedule(samples) {
+      if (!samples.length || !this.ctx) return;
+      // The buffer carries Kokoro's 24 kHz rate; the context resamples it to
+      // its own output rate on playback.
+      const buffer = this.ctx.createBuffer(1, samples.length, this.sampleRate);
+      buffer.copyToChannel(samples, 0);
+      const source = this.ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(this.ctx.destination);
+      // First chunk starts after a small lead-in so CPU synthesis that briefly
+      // lags realtime doesn't cause an immediate underrun; later chunks chain
+      // off the cursor (Math.max guards against a cursor that fell behind).
+      const startAt = this.nextStartTime > 0
+        ? Math.max(this.ctx.currentTime, this.nextStartTime)
+        : this.ctx.currentTime + this.leadIn;
+      source.start(startAt);
+      this.nextStartTime = startAt + buffer.duration;
+      this.sources.add(source);
+      this._setButton(this.button, "playing");
+      source.onended = () => {
+        this.sources.delete(source);
+        if (!this.streaming && !this.sources.size) this.stop();
+      };
+    },
+
+    stop() {
+      if (this.controller) { this.controller.abort(); this.controller = null; }
+      for (const source of this.sources) {
+        try { source.onended = null; source.stop(); } catch { /* already ended */ }
+      }
+      this.sources.clear();
+      if (this.ctx) { this.ctx.close().catch(() => {}); this.ctx = null; }
+      this.streaming = false;
+      if (this.button) { this._setButton(this.button, "idle"); this.button = null; }
+    },
+
+    _setButton(button, state) {
+      if (!button) return;
+      const labels = {
+        idle: ["🔊 Play", "Read this message aloud"],
+        loading: ["⏳ …", "Synthesizing speech…"],
+        playing: ["⏹ Stop", "Stop playback"],
+      };
+      const [text, title] = labels[state] || labels.idle;
+      button.textContent = text;
+      button.title = title;
+      button.classList.toggle("tts-active", state !== "idle");
+    },
+  };
+
   // ---------- Edit & regenerate ----------
 
   function attachMessageActions(bubble, role, index) {
@@ -1493,6 +1688,22 @@
       action.addEventListener("click", () => regenerateFrom(index));
     }
     actions.appendChild(action);
+    // Speaker button: reads the message's current text via Kokoro TTS. Hidden
+    // entirely when the server reports the feature unavailable.
+    if (ttsEnabled) {
+      const speak = document.createElement("button");
+      speak.type = "button";
+      speak.className = "message-action tts-button";
+      speak.textContent = "🔊 Play";
+      speak.title = "Read this message aloud";
+      speak.addEventListener("click", () => {
+        const message = messages[index];
+        if (!message) return;
+        const text = speechText(message.display ?? extractMessageText(message.content));
+        ttsPlayer.toggle(text, speak);
+      });
+      actions.appendChild(speak);
+    }
     bubble.appendChild(actions);
   }
 

@@ -15,6 +15,10 @@ Image generation (OpenAI-compatible /images/generations, capability-detected):
   * GET  /api/images/capability  -> whether the connected server can generate images
   * POST /api/images             -> generate image(s) from a text prompt
 
+Text-to-speech (Kokoro-82M, fully local & offline, CPU-only so it never takes
+VRAM from the LLM):
+  * POST /api/tts                -> stream synthesized speech as raw float32 PCM
+
 Document upload (text is extracted server-side and injected into the chat):
   * POST /api/upload             -> extract text from an uploaded PDF
 
@@ -36,6 +40,7 @@ System prompt presets (SQLite, server-side — reusable named personas):
 from __future__ import annotations
 
 import copy
+import importlib.util
 import io
 import json
 import logging
@@ -61,7 +66,7 @@ from urllib.parse import parse_qsl, urldefrag, urljoin, urlsplit
 
 import httpx
 from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, Field
@@ -172,6 +177,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # the model's context window: ~12 excerpts ≈ 4k tokens.
         "research_top_k": 12,
     },
+    "tts": {
+        # Master switch; when False the message speaker button is hidden and
+        # /api/tts returns 503. Kokoro-82M runs fully offline on the CPU.
+        "enabled": True,
+        # Kokoro language code: 'a' American English, 'b' British English,
+        # 'e' Spanish, 'f' French, 'h' Hindi, 'i' Italian, 'p' Portuguese,
+        # 'j' Japanese, 'z' Mandarin (some need extra packages / espeak-ng).
+        "lang_code": "a",
+        # Default voice (see Kokoro's voice list, e.g. af_heart, af_bella,
+        # am_michael, bf_emma). Its locale must match lang_code.
+        "voice": "af_heart",
+        # Speech rate multiplier (1.0 = natural).
+        "speed": 1.0,
+        # Kokoro's native output rate. The client reads this from a response
+        # header; only change it if you change Kokoro's output.
+        "sample_rate": 24000,
+        # Reject over-long requests so one call can't tie up the CPU for ages.
+        "max_chars": 5000,
+        # Preload the model in a background thread at startup so the first
+        # request isn't slow. Set False to defer the load until first use.
+        "warmup": True,
+    },
     "tls": {
         "enabled": False,
         "cert_file": None,
@@ -243,7 +270,172 @@ image_client = OpenAI(
     timeout=CONFIG["image_generation"]["timeout_seconds"],
 )
 
-app = FastAPI(title="LocalMind", version="1.1.0")
+# ---------- Text-to-speech (Kokoro-82M, fully local & offline) ----------
+#
+# Kokoro synthesizes speech entirely on-device. The pipeline is pinned to the
+# CPU so it never competes with the LLM for VRAM, and it is built once and
+# reused — importing torch and loading the model is slow, but only on first
+# use. Synthesis is serialized by a lock: a single KPipeline is not safe to
+# drive from several requests at once, and one CPU TTS job already wants every
+# core. Everything degrades gracefully when the optional `kokoro` package is
+# absent (the UI hides the speaker button; the endpoint returns 503).
+
+
+class TTSUnavailable(RuntimeError):
+    """Raised when Kokoro cannot be imported or initialized."""
+
+
+_tts_pipeline: Any = None
+_tts_init_lock = threading.Lock()   # guards one-time pipeline construction
+_tts_synth_lock = threading.Lock()  # serializes synthesis across requests
+# Latched ONLY when the package is genuinely missing (permanent until restart);
+# a transient construction failure (e.g. a network blip during the model
+# download) is not latched so the next request retries.
+_tts_init_error: Optional[str] = None
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """Coerce a config value to a positive int, falling back on junk input."""
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return default
+    return coerced if coerced > 0 else default
+
+
+# Frozen once at import (CONFIG is loaded once too). Coerced defensively so a
+# malformed max_chars in config.json can't crash the TTSRequest field below.
+TTS_MAX_CHARS = _positive_int(CONFIG["tts"]["max_chars"], 5000)
+
+
+def tts_supported() -> bool:
+    """Cheap check (no model load) for whether the TTS feature is usable.
+
+    True only when enabled in config *and* the kokoro package is importable,
+    so a missing dependency keeps the UI button hidden instead of erroring on
+    every click. A prior failed init also flips this off.
+    """
+    if not CONFIG["tts"]["enabled"] or _tts_init_error:
+        return False
+    return importlib.util.find_spec("kokoro") is not None
+
+
+def get_tts_pipeline() -> Any:
+    """Return the shared Kokoro pipeline, building it on first use.
+
+    Construction (torch import + model download/load) can take several seconds,
+    so it happens once under a lock and is cached. Raises TTSUnavailable with a
+    user-facing message when Kokoro is missing or fails to initialize.
+    """
+    global _tts_pipeline, _tts_init_error
+    if _tts_pipeline is not None:
+        return _tts_pipeline
+    if not CONFIG["tts"]["enabled"]:
+        raise TTSUnavailable("Text-to-speech is disabled in the server configuration.")
+    with _tts_init_lock:
+        if _tts_pipeline is not None:
+            return _tts_pipeline
+        try:
+            from kokoro import KPipeline
+        except Exception as exc:  # ImportError or a transitive import failure
+            _tts_init_error = (
+                "The 'kokoro' package is not installed. Install it with "
+                "`pip install kokoro` to enable text-to-speech."
+            )
+            logger.warning("TTS unavailable: %s (%s)", _tts_init_error, exc)
+            raise TTSUnavailable(_tts_init_error) from exc
+        try:
+            lang_code = CONFIG["tts"]["lang_code"]
+            logger.info("Initializing Kokoro TTS pipeline (lang_code=%s, device=cpu)…",
+                        lang_code)
+            # device='cpu' keeps TTS off the GPU so it never steals VRAM from the LLM.
+            _tts_pipeline = KPipeline(lang_code=lang_code, device="cpu")
+            logger.info("Kokoro TTS pipeline ready.")
+        except Exception as exc:
+            # Construction (model download / load) can fail transiently. Do NOT
+            # latch _tts_init_error here, so the next request retries instead of
+            # disabling TTS until restart — unlike a missing package (above),
+            # which is permanent.
+            message = f"Failed to initialize the Kokoro TTS pipeline: {exc}"
+            logger.exception("TTS initialization failed (will retry on next request)")
+            raise TTSUnavailable(message) from exc
+    return _tts_pipeline
+
+
+def _segment_to_pcm_bytes(audio: Any) -> bytes:
+    """Convert one Kokoro audio segment to little-endian float32 PCM bytes.
+
+    Kokoro yields float32 samples in [-1, 1] (a torch tensor or a numpy array);
+    we ship them as raw 32-bit float so the browser's Web Audio API can play
+    each chunk with no decode step. '<f4' pins little-endian regardless of host.
+    """
+    import numpy as np
+
+    if audio is None:
+        return b""
+    if hasattr(audio, "detach"):  # torch tensor
+        audio = audio.detach().to("cpu").numpy()
+    arr = np.ascontiguousarray(audio, dtype="<f4").reshape(-1)
+    return arr.tobytes()
+
+
+def stream_tts(pipeline: Any, request: "TTSRequest") -> Iterator[bytes]:
+    """Yield raw float32 PCM as Kokoro produces each sentence/segment.
+
+    The synthesis lock is held only around each segment's CPU work — never
+    across a ``yield`` — so a slow or disconnected client can neither block
+    other TTS requests nor strand the lock, while the single non-reentrant
+    pipeline is still driven by at most one thread at a time.
+
+    Text is pre-split on newlines so a G2P failure in one paragraph only skips
+    that paragraph rather than aborting the entire stream.
+    """
+    cfg = CONFIG["tts"]
+    voice = request.voice or cfg["voice"]
+    speed = request.speed or cfg["speed"]
+    text = request.text.strip()
+    lines = [line for line in re.split(r"\n+", text) if line.strip()]
+    for line in lines:
+        # split_pattern=None: we already split by newline above; let Kokoro's
+        # tokenizer handle sentence chunking within each line. Creating the
+        # generator is lazy (Kokoro's __call__ yields), so the model isn't
+        # touched until the first next() below, which runs under the lock.
+        generator = pipeline(line, voice=voice, speed=speed, split_pattern=None)
+        while True:
+            with _tts_synth_lock:
+                try:
+                    result = next(generator)
+                except StopIteration:
+                    break
+                except Exception:
+                    logger.warning("TTS skipped a segment due to synthesis error",
+                                   exc_info=True)
+                    break
+            # Kokoro yields (graphemes, phonemes, audio); tolerate either a
+            # tuple/list or an object exposing .audio across kokoro versions.
+            audio = getattr(result, "audio", None)
+            if audio is None and isinstance(result, (tuple, list)):
+                audio = result[-1]
+            chunk = _segment_to_pcm_bytes(audio)
+            if chunk:
+                yield chunk
+
+
+def _warm_tts_pipeline() -> None:
+    """Best-effort background preload so the first /api/tts call isn't slow."""
+    try:
+        get_tts_pipeline()
+    except TTSUnavailable:
+        pass  # already logged; the feature just stays unavailable
+    except Exception:
+        logger.exception("Unexpected error while warming the TTS pipeline")
+
+
+if CONFIG["tts"].get("warmup", True) and tts_supported():
+    threading.Thread(target=_warm_tts_pipeline, name="tts-warmup", daemon=True).start()
+
+
+app = FastAPI(title="LocalMind", version="1.2.0")
 
 
 class ChatMessage(BaseModel):
@@ -293,6 +485,14 @@ class ImageRequest(BaseModel):
     enhance_with: Optional[str] = Field(default=None, min_length=1)
 
 
+class TTSRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=TTS_MAX_CHARS)
+    # Optional per-request overrides; fall back to the configured defaults.
+    # The voice pattern matches Kokoro's identifiers (e.g. "af_heart").
+    voice: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_]{1,80}$")
+    speed: Optional[float] = Field(default=None, ge=0.5, le=2.0)
+
+
 def connection_error_payload() -> dict[str, str]:
     return {
         "error": (
@@ -324,6 +524,8 @@ def get_config() -> dict[str, Any]:
         },
         # Lets the UI hide the composer toggle when web search is turned off.
         "web_search": {"enabled": CONFIG["web_search"]["enabled"]},
+        # Lets the UI hide the speaker button when TTS is off or unavailable.
+        "tts": {"enabled": tts_supported()},
         "base_url": CONFIG["lm_studio_base_url"],
     }
 
@@ -2672,6 +2874,48 @@ def chat(request: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/tts")
+def tts(request: TTSRequest) -> Response:
+    """Stream Kokoro-synthesized speech as raw float32 PCM.
+
+    Audio starts flowing as soon as the first sentence is rendered, so the
+    client can begin playback without waiting for the whole text. The format is
+    advertised via X-* headers (mono, 32-bit float, little-endian, at the
+    configured sample rate) since raw PCM carries no header of its own.
+    """
+    try:
+        pipeline = get_tts_pipeline()
+    except TTSUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    if not request.text.strip():
+        return JSONResponse(status_code=400, content={"error": "No text to read aloud."})
+
+    chunks = stream_tts(pipeline, request)
+    # Pull the first chunk here, in the handler, so an empty result (e.g. an
+    # unknown voice, or a missing espeak-ng for out-of-vocabulary words) becomes
+    # a JSON error instead of a committed 200 with a silent empty body — once
+    # StreamingResponse begins, the status line can no longer change.
+    try:
+        first_chunk = next(chunks)
+    except StopIteration:
+        return JSONResponse(status_code=500,
+                            content={"error": "Speech synthesis produced no audio."})
+
+    def body() -> Iterator[bytes]:
+        yield first_chunk
+        yield from chunks
+
+    sample_rate = int(CONFIG["tts"]["sample_rate"])
+    headers = {
+        "X-Sample-Rate": str(sample_rate),
+        "X-Audio-Channels": "1",
+        "X-Audio-Format": "f32le",
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",  # don't let a proxy buffer the live stream
+    }
+    return StreamingResponse(body(), media_type="application/octet-stream", headers=headers)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

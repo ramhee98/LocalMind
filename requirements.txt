@@ -6,3 +6,8 @@ pypdf>=4,<7
 ddgs>=9,<10
 python-multipart>=0.0.9,<1.0
 cryptography>=42
+# Offline, CPU-only text-to-speech (Kokoro-82M). Pulls in torch + numpy.
+# Some languages also need the system `espeak-ng` binary for grapheme-to-
+# phoneme fallback (English mostly works without it). Optional: the app runs
+# fine without it — the speaker button just stays hidden.
+kokoro>=0.9,<1.0

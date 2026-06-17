@@ -27,6 +27,7 @@ LocalMind is a small FastAPI application with a vanilla HTML/CSS/JS frontend. It
 - **Context-window meter** — a gauge in the composer estimates the prompt size (system prompt, history, attachments, retrieved RAG chunks, and your draft) against the loaded model's actual context window, turning yellow at 80% and red at 95%.
 - **Document retrieval (RAG)** — long uploads are chunked, embedded with a local embedding model, and queried by relevance per question (only the top matches enter the prompt) — so you can chat about a big PDF without blowing the context window. Small docs are still inlined.
 - **Web search & research (🌐)** — a Web control in the composer grounds answers in live web results, in two modes. *Search*: the chat model distills your question (with conversation context, so follow-ups work) into a search query, the top result pages are downloaded and embed-ranked against it with the local embedding model, and the best excerpts are injected into the prompt with sources cited inline as links. *Research*: a bounded multi-round pipeline — the model plans sub-queries, results are LLM-filtered for relevance and their pages read, the model reviews the findings for gaps and searches again, and everything is synthesized into a structured, cited answer (slower, deeper). In either mode, URLs pasted into the message are fetched directly and their content injected, so you can ask about pages search engines don't index; ask for a deep dive and same-site links are crawled too, or ask to use only the linked pages and the engine search is skipped entirely. Works out of the box via DuckDuckGo (no API key), or point it at a self-hosted [SearXNG](https://docs.searxng.org/) instance to keep queries on your own infrastructure. If a search fails, you get a toast and the model answers without web results.
+- **Text-to-speech (🔊)** — every message gets a speaker button that reads it aloud using [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), a small, high-quality voice model that runs **fully offline** with no external API. It is pinned to the **CPU** so it never takes VRAM from your LLM, and the audio **streams sentence-by-sentence** (raw PCM played via the Web Audio API), so playback starts on the first sentence instead of waiting for the whole reply. Optional: if the `kokoro` package isn't installed the button simply stays hidden.
 - **Robust error handling** — a clear UI banner (with retry) when LM Studio is offline, unreachable, or has no model loaded; toast notifications for load/unload results.
 - **Simple configuration** — a single `config.json`, with safe fallback to `config.template.json` and built-in defaults.
 
@@ -255,6 +256,36 @@ The button activates only when the connected server actually supports image gene
 
 Chat continues to use LM Studio regardless — the image API is fully independent. Image prompts are not added to the LLM chat history.
 
+### Text-to-speech
+
+Hover any message and click **🔊 Play** to hear it read aloud; the button becomes **⏹ Stop** while it plays. Speech is synthesized locally by [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) on the **CPU** (so it never competes with your LLM for VRAM) and **streams sentence-by-sentence** — `/api/tts` returns raw float32 PCM as each sentence is rendered, and the browser schedules the chunks gaplessly through the Web Audio API, so playback begins almost immediately instead of after the whole paragraph.
+
+It is **optional and fully offline** — no external API is ever contacted. To enable it:
+
+```bash
+pip install kokoro          # already in requirements.txt; pulls in torch + numpy
+# Some languages also need the system espeak-ng binary for out-of-vocabulary
+# words (English largely works without it):
+#   macOS:  brew install espeak-ng
+#   Debian: sudo apt-get install espeak-ng
+```
+
+On first use the ~330 MB model is downloaded once from Hugging Face and cached; the pipeline is then warmed in the background at startup so the first click is fast. If `kokoro` isn't installed, the speaker button stays hidden and everything else works normally. Configure it under `tts` in `config.json`:
+
+```json
+"tts": {
+  "enabled": true,
+  "lang_code": "a",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "sample_rate": 24000,
+  "max_chars": 5000,
+  "warmup": true
+}
+```
+
+`lang_code` selects the language (`a` American / `b` British English, `e` Spanish, `f` French, `i` Italian, `p` Portuguese, `h` Hindi, `j` Japanese, `z` Mandarin) and must match the locale of `voice` (see [Kokoro's voice list](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)). `max_chars` caps a single request so one synthesis can't tie up the CPU; set `warmup` to `false` to defer the model load until the first click.
+
 ## HTTPS
 
 Set `tls.enabled` to `true` and restart:
@@ -320,6 +351,7 @@ When running in Docker on the same machine as LM Studio, set `lm_studio_base_url
 | `POST` | `/api/models/unload-all` | Unload every loaded instance |
 | `GET` | `/api/images/capability` | Whether the image API supports generation (`?refresh=true` re-probes) |
 | `POST` | `/api/images` | Generate image(s): `{"prompt", "size"?, "n"?, "enhance_with"?}` |
+| `POST` | `/api/tts` | Stream speech as raw float32 PCM (Kokoro): `{"text", "voice"?, "speed"?}`; `503` when TTS is unavailable |
 
 ## License
 

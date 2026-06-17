@@ -54,6 +54,15 @@
     "research_queries_per_round": 3,
     "research_top_k": 12
   },
+  "tts": {
+    "enabled": true,
+    "lang_code": "a",
+    "voice": "af_heart",
+    "speed": 1.0,
+    "sample_rate": 24000,
+    "max_chars": 5000,
+    "warmup": true
+  },
   "tls": {
     "enabled": false,
     "cert_file": null,

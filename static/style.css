@@ -889,6 +889,12 @@ input[type="number"] {
   color: var(--text);
 }
 
+/* Speaker button while loading or playing: keep it visibly "armed". */
+.message-action.tts-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .message.editing { width: 78%; }
 
 .message .edit-area {
