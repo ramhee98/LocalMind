@@ -320,6 +320,40 @@ def tts_supported() -> bool:
     return importlib.util.find_spec("kokoro") is not None
 
 
+def _configure_espeak_fallback() -> bool:
+    """Point phonemizer at a bundled espeak-ng before Kokoro builds its G2P.
+
+    Kokoro's English G2P only covers dictionary words; out-of-vocabulary words
+    (proper names, foreign words) need an espeak-ng fallback. misaki can't build
+    that fallback unless a usable espeak-ng library is loadable, so without one
+    Kokoro silently drops those words — names just go missing from the speech.
+    The `espeakng-loader` package ships a prebuilt library for every platform,
+    so we wire it in here and no system install is required.
+
+    Best-effort: if the loader or phonemizer is absent we log and carry on (TTS
+    still works, it just skips unknown names as before). An espeak-ng the user
+    already configured is left untouched.
+    """
+    try:
+        import espeakng_loader
+        from phonemizer.backend.espeak.wrapper import EspeakWrapper
+    except Exception as exc:
+        logger.warning("espeak-ng fallback unavailable (%s); Kokoro will skip "
+                       "out-of-vocabulary words such as proper names. Install "
+                       "'espeakng-loader' to enable it.", exc)
+        return False
+    try:
+        if not getattr(EspeakWrapper, "_ESPEAK_LIBRARY", None):
+            EspeakWrapper.set_library(espeakng_loader.get_library_path())
+        # espeak-ng resolves its phoneme data from this env var; set before the
+        # library is initialized (i.e. before KPipeline construction).
+        os.environ.setdefault("ESPEAK_DATA_PATH", espeakng_loader.get_data_path())
+        return True
+    except Exception:
+        logger.warning("Could not configure the espeak-ng fallback", exc_info=True)
+        return False
+
+
 def get_tts_pipeline() -> Any:
     """Return the shared Kokoro pipeline, building it on first use.
 
@@ -335,6 +369,8 @@ def get_tts_pipeline() -> Any:
     with _tts_init_lock:
         if _tts_pipeline is not None:
             return _tts_pipeline
+        # Must run before kokoro is imported so misaki picks up the library.
+        _configure_espeak_fallback()
         try:
             from kokoro import KPipeline
         except Exception as exc:  # ImportError or a transitive import failure

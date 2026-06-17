@@ -263,12 +263,10 @@ Hover any message and click **🔊 Play** to hear it read aloud; the button beco
 It is **optional and fully offline** — no external API is ever contacted. To enable it:
 
 ```bash
-pip install kokoro          # already in requirements.txt; pulls in torch + numpy
-# Some languages also need the system espeak-ng binary for out-of-vocabulary
-# words (English largely works without it):
-#   macOS:  brew install espeak-ng
-#   Debian: sudo apt-get install espeak-ng
+pip install kokoro espeakng-loader   # already in requirements.txt
 ```
+
+Both ship with `requirements.txt`; `kokoro` pulls in torch + numpy. `espeakng-loader` bundles a prebuilt **espeak-ng** library (no system install needed) that Kokoro uses to pronounce out-of-vocabulary words — proper names, foreign words — that aren't in its dictionary. Without it those words are silently dropped, so it's recommended; if you'd rather use a system espeak-ng you already have, that is picked up automatically and the loader is skipped.
 
 On first use the ~330 MB model is downloaded once from Hugging Face and cached; the pipeline is then warmed in the background at startup so the first click is fast. If `kokoro` isn't installed, the speaker button stays hidden and everything else works normally. Configure it under `tts` in `config.json`:
 

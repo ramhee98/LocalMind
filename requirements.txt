@@ -7,7 +7,10 @@ ddgs>=9,<10
 python-multipart>=0.0.9,<1.0
 cryptography>=42
 # Offline, CPU-only text-to-speech (Kokoro-82M). Pulls in torch + numpy.
-# Some languages also need the system `espeak-ng` binary for grapheme-to-
-# phoneme fallback (English mostly works without it). Optional: the app runs
-# fine without it — the speaker button just stays hidden.
-kokoro>=0.9,<1.0
+# Optional: the app runs fine without it — the speaker button just stays hidden.
+kokoro>=0.7,<1.0
+# Bundles a prebuilt espeak-ng library (no system install) so Kokoro's G2P can
+# pronounce out-of-vocabulary words — proper names, foreign words — instead of
+# silently dropping them. Without it the speaker button still works but skips
+# unknown names.
+espeakng-loader>=0.2,<1.0
