@@ -195,6 +195,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sample_rate": 24000,
         # Reject over-long requests so one call can't tie up the CPU for ages.
         "max_chars": 5000,
+        # Max simultaneous synthesis requests; further ones get 429 (busy)
+        # rather than queueing and pinning shared worker threads.
+        "max_concurrent": 2,
         # Preload the model in a background thread at startup so the first
         # request isn't slow. Set False to defer the load until first use.
         "warmup": True,
@@ -306,6 +309,15 @@ def _positive_int(value: Any, default: int) -> int:
 # Frozen once at import (CONFIG is loaded once too). Coerced defensively so a
 # malformed max_chars in config.json can't crash the TTSRequest field below.
 TTS_MAX_CHARS = _positive_int(CONFIG["tts"]["max_chars"], 5000)
+
+# Caps how many TTS requests synthesize at once. Each in-flight request occupies
+# one of the server's shared sync-route worker threads for its whole stream, so
+# without a cap a burst of TTS calls could starve other endpoints. We reject
+# fast (429) past the cap rather than queueing blocked threads. A small value is
+# plenty: CPU synthesis is serialized by _tts_synth_lock anyway, so extra slots
+# only buy a little tolerance for the brief overlap when switching messages.
+TTS_MAX_CONCURRENT = _positive_int(CONFIG["tts"].get("max_concurrent"), 2)
+_tts_slots = threading.Semaphore(TTS_MAX_CONCURRENT)
 
 
 def tts_supported() -> bool:
@@ -2928,30 +2940,58 @@ def tts(request: TTSRequest) -> Response:
     if not request.text.strip():
         return JSONResponse(status_code=400, content={"error": "No text to read aloud."})
 
-    chunks = stream_tts(pipeline, request)
-    # Pull the first chunk here, in the handler, so an empty result (e.g. an
-    # unknown voice, or a missing espeak-ng for out-of-vocabulary words) becomes
-    # a JSON error instead of a committed 200 with a silent empty body — once
-    # StreamingResponse begins, the status line can no longer change.
+    # Bound concurrent synthesis. Acquire without blocking so a request over the
+    # cap fails fast instead of parking a worker thread on the semaphore.
+    if not _tts_slots.acquire(blocking=False):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "The text-to-speech engine is busy. Try again in a moment."},
+            headers={"Retry-After": "2"},
+        )
+    # The slot must be released exactly once, whichever way we leave: an early
+    # error return, normal stream completion, a client disconnect (the body
+    # generator is closed -> GeneratorExit -> finally), or an unexpected error.
+    released = False
+
+    def release_slot() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            _tts_slots.release()
+
     try:
-        first_chunk = next(chunks)
-    except StopIteration:
-        return JSONResponse(status_code=500,
-                            content={"error": "Speech synthesis produced no audio."})
+        chunks = stream_tts(pipeline, request)
+        # Pull the first chunk here, in the handler, so an empty result (e.g. an
+        # unknown voice, or missing espeak-ng for out-of-vocabulary words)
+        # becomes a JSON error instead of a committed 200 with a silent empty
+        # body — once StreamingResponse begins, the status line can't change.
+        try:
+            first_chunk = next(chunks)
+        except StopIteration:
+            release_slot()
+            return JSONResponse(status_code=500,
+                                content={"error": "Speech synthesis produced no audio."})
 
-    def body() -> Iterator[bytes]:
-        yield first_chunk
-        yield from chunks
+        def body() -> Iterator[bytes]:
+            try:
+                yield first_chunk
+                yield from chunks
+            finally:
+                release_slot()
 
-    sample_rate = int(CONFIG["tts"]["sample_rate"])
-    headers = {
-        "X-Sample-Rate": str(sample_rate),
-        "X-Audio-Channels": "1",
-        "X-Audio-Format": "f32le",
-        "Cache-Control": "no-store",
-        "X-Accel-Buffering": "no",  # don't let a proxy buffer the live stream
-    }
-    return StreamingResponse(body(), media_type="application/octet-stream", headers=headers)
+        sample_rate = int(CONFIG["tts"]["sample_rate"])
+        headers = {
+            "X-Sample-Rate": str(sample_rate),
+            "X-Audio-Channels": "1",
+            "X-Audio-Format": "f32le",
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",  # don't let a proxy buffer the live stream
+        }
+        return StreamingResponse(body(), media_type="application/octet-stream", headers=headers)
+    except BaseException:
+        # Anything thrown before we hand the stream to Starlette must free the slot.
+        release_slot()
+        raise
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

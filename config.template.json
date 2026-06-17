@@ -61,6 +61,7 @@
     "speed": 1.0,
     "sample_rate": 24000,
     "max_chars": 5000,
+    "max_concurrent": 2,
     "warmup": true
   },
   "tls": {

@@ -278,11 +278,12 @@ On first use the ~330 MB model is downloaded once from Hugging Face and cached; 
   "speed": 1.0,
   "sample_rate": 24000,
   "max_chars": 5000,
+  "max_concurrent": 2,
   "warmup": true
 }
 ```
 
-`lang_code` selects the language (`a` American / `b` British English, `e` Spanish, `f` French, `i` Italian, `p` Portuguese, `h` Hindi, `j` Japanese, `z` Mandarin) and must match the locale of `voice` (see [Kokoro's voice list](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)). `max_chars` caps a single request so one synthesis can't tie up the CPU; set `warmup` to `false` to defer the model load until the first click.
+`lang_code` selects the language (`a` American / `b` British English, `e` Spanish, `f` French, `i` Italian, `p` Portuguese, `h` Hindi, `j` Japanese, `z` Mandarin) and must match the locale of `voice` (see [Kokoro's voice list](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)). `max_chars` caps a single request so one synthesis can't tie up the CPU; `max_concurrent` bounds simultaneous synthesis (further requests get a `429` instead of queueing and tying up worker threads); set `warmup` to `false` to defer the model load until the first click.
 
 ## HTTPS
 
