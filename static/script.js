@@ -273,6 +273,9 @@
     updateContextMeter();
   });
 
+  // The meter reserves room for the reply, so it moves with max_tokens too.
+  maxTokensInput.addEventListener("input", updateContextMeter);
+
   presetSelect.addEventListener("change", () => {
     if (presetSelect.value) {
       applyPreset(presetSelect.value);
@@ -703,6 +706,8 @@
   // Rough heuristic: ~4 characters per token, plus a flat cost per image.
   const CHARS_PER_TOKEN = 4;
   const IMAGE_TOKEN_ESTIMATE = 800;
+  // Below this much free context the model has no usable room to answer in.
+  const MIN_REPLY_TOKENS = 512;
 
   function estimateTokens(text) {
     return Math.ceil((text || "").length / CHARS_PER_TOKEN);
@@ -777,14 +782,30 @@
     }
     const used = estimateUsedTokens();
     const percent = Math.min(100, Math.round((used / limit) * 100));
+    // The reply is generated into the same window as the prompt, so a prompt
+    // that fits on its own can still leave too little room to answer into:
+    // yellow once the answer can't reach max_tokens, red once it barely fits.
+    const headroom = Math.max(0, limit - used);
+    const wanted = Math.max(1, Math.floor(Number(maxTokensInput.value) || 1024));
+    // Only meaningful when max_tokens is reachable at all: if it already exceeds
+    // the whole window, even an empty conversation falls short and a permanent
+    // warning would say nothing.
+    const squeezed = wanted < limit && headroom < wanted;
+    const cramped = headroom < MIN_REPLY_TOKENS;
     contextMeterFill.style.width = `${percent}%`;
-    contextMeterFill.classList.toggle("warn", percent >= 80 && percent < 95);
-    contextMeterFill.classList.toggle("danger", percent >= 95);
+    contextMeterFill.classList.toggle(
+      "warn", !cramped && percent < 95 && (percent >= 80 || squeezed));
+    contextMeterFill.classList.toggle("danger", cramped || percent >= 95);
     contextMeterText.textContent = `≈${formatTokens(used)} / ${formatTokens(limit)}`;
     contextMeter.title =
       `Estimated prompt size: ~${used.toLocaleString()} of ` +
       `${limit.toLocaleString()} tokens (${percent}%).\n` +
-      "Covers the system prompt, history, attachments, and your draft — " +
+      `Room left for the reply: ~${headroom.toLocaleString()} tokens` +
+      (squeezed
+        ? ` — short of the ${wanted.toLocaleString()} requested by max_tokens, ` +
+          "so the answer may be cut off. Load the model with a larger context."
+        : ".") +
+      "\nCovers the system prompt, history, attachments, and your draft — " +
       "a character-based estimate, not an exact token count.";
     contextMeter.classList.remove("hidden");
   }

@@ -68,7 +68,7 @@ import httpx
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
@@ -91,6 +91,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "host": "0.0.0.0",
     "port": 8000,
     "request_timeout_seconds": 120,
+    # Streaming chat needs its own, larger budget: evaluating a long prompt can
+    # take minutes before the first token arrives, and the shorter request
+    # timeout above would abort the stream while LM Studio is still working.
+    "stream_timeout_seconds": 600,
     "defaults": {
         "temperature": 0.7,
         "max_tokens": 1024,
@@ -1171,7 +1175,7 @@ def embed_texts(inputs: list[str]) -> Optional[list[list[float]]]:
         try:
             response = client.embeddings.create(
                 model=CONFIG["rag"]["embedding_model"], input=missing)
-        except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+        except APIError as exc:
             logger.warning("Embedding request failed: %s", getattr(exc, "message", exc))
             return None
         vectors.update(zip(missing, (item.embedding for item in response.data)))
@@ -1318,7 +1322,7 @@ def generate_images(request: ImageRequest) -> JSONResponse:
             prompt = enhance_prompt(request.enhance_with, request.prompt)
             logger.info("Prompt enhanced by %s: %r -> %r",
                         request.enhance_with, request.prompt, prompt)
-        except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+        except APIError as exc:
             enhancement_error = getattr(exc, "message", None) or str(exc)
             logger.warning("Prompt enhancement failed, using original prompt: %s",
                            enhancement_error)
@@ -1342,6 +1346,11 @@ def generate_images(request: ImageRequest) -> JSONResponse:
         )
     except APIStatusError as exc:
         logger.exception("Image API returned an error during generation")
+        return JSONResponse(status_code=502, content={"error": f"Image API error: {exc.message}"})
+    except APIError as exc:
+        # A failure reported inside a 200 response body rather than as an HTTP
+        # status arrives as the base APIError, which the clauses above miss.
+        logger.exception("Image API failed during generation")
         return JSONResponse(status_code=502, content={"error": f"Image API error: {exc.message}"})
 
     images: list[str] = []
@@ -1512,6 +1521,9 @@ def list_models() -> JSONResponse:
         return JSONResponse(status_code=502, content=connection_error_payload())
     except APIStatusError as exc:
         logger.exception("LM Studio returned an error while listing models")
+        return JSONResponse(status_code=502, content={"error": f"LM Studio error: {exc.message}"})
+    except APIError as exc:
+        logger.exception("LM Studio failed while listing models")
         return JSONResponse(status_code=502, content={"error": f"LM Studio error: {exc.message}"})
     return JSONResponse(content={"models": models})
 
@@ -1832,7 +1844,7 @@ def quick_completion(model: str, system: str, user: str, max_tokens: int = 300) 
             # Reasoning models would otherwise spend the budget thinking.
             extra_body={"reasoning_effort": "none"},
         )
-    except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+    except APIError as exc:
         logger.warning("Helper completion failed: %s", getattr(exc, "message", exc))
         return None
     text = (completion.choices[0].message.content or "").strip()
@@ -2882,6 +2894,9 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
             max_tokens=request.max_tokens,
             stream=True,
             extra_body=extra_body or None,
+            # A long conversation can take minutes to evaluate before the first
+            # token; the client-wide request timeout is far too short for that.
+            timeout=CONFIG["stream_timeout_seconds"],
         )
         for chunk in stream:
             if not chunk.choices:
@@ -2907,6 +2922,25 @@ def stream_completion(request: ChatRequest) -> Iterator[str]:
     except APIStatusError as exc:
         logger.exception("LM Studio returned an error during chat completion")
         yield f"data: {json.dumps({'error': f'LM Studio error: {exc.message}'})}\n\n"
+    except APIError as exc:
+        # A failure raised once streaming has begun — most often the prompt
+        # exceeding the loaded context window — is delivered by LM Studio as an
+        # error payload inside a 200 response, which the SDK raises as the base
+        # APIError rather than APIStatusError. Without this clause the real
+        # message is swallowed by the catch-all below.
+        logger.exception("LM Studio failed mid-stream during chat completion")
+        yield f"data: {json.dumps({'error': f'LM Studio error: {exc.message}'})}\n\n"
+    except httpx.TimeoutException:
+        # The SDK converts timeouts into APITimeoutError only around the initial
+        # request; one raised while iterating the stream — LM Studio still busy
+        # evaluating a long prompt — surfaces as a raw httpx error and would
+        # otherwise be swallowed by the catch-all below.
+        seconds = CONFIG["stream_timeout_seconds"]
+        logger.exception("LM Studio timed out during chat completion")
+        message = (f"LM Studio did not respond within {seconds}s. A very long "
+                   "conversation can take longer than that to process — shorten "
+                   "it, or raise stream_timeout_seconds in config.json.")
+        yield f"data: {json.dumps({'error': message})}\n\n"
     except Exception:  # noqa: BLE001 — never leak a raw traceback into the stream
         logger.exception("Unexpected error during chat completion")
         yield f"data: {json.dumps({'error': 'Unexpected server error. Check the application logs.'})}\n\n"

@@ -87,6 +87,7 @@ cp config.template.json config.json
 | `host` | Interface the web app binds to | `0.0.0.0` |
 | `port` | Port the web app listens on | `8000` |
 | `request_timeout_seconds` | Timeout for requests to LM Studio | `120` |
+| `stream_timeout_seconds` | Timeout for a streaming chat reply — a long conversation can take minutes to evaluate before the first token | `600` |
 | `defaults.temperature` | Initial temperature in the UI | `0.7` |
 | `defaults.max_tokens` | Initial max tokens in the UI | `1024` |
 | `defaults.system_prompt` | System prompt prepended to every conversation | `You are a helpful assistant.` |
